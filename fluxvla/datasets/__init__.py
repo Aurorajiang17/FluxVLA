@@ -20,5 +20,6 @@ from .openai_eval_dataset import *  # noqa: F401, F403
 from .parquet_dataset import *  # noqa: F401, F403
 from .parquet_dataset_v3 import *  # noqa: F401, F403
 from .robodojo_dataset import *  # noqa: F401, F403
+from .robolab_dataset import *  # noqa: F401, F403
 from .sarm_dataset import *  # noqa: F401, F403
 from .utils import *  # noqa: F401, F403
