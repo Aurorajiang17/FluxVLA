@@ -2,6 +2,7 @@ test/test_configs
 test/test_datasets/test_robolab_dataset.py
 test/test_tokenizers/test_paligemma_tokenizer.py
 test/test_transforms/test_robolab_input_pipeline.py
+test/test_transforms/test_robolab_output_pipeline.py
 test/test_models/test_llm_backbone.py::test_tiny_llm_forward_backward_and_causal_mask
 test/test_models/test_llm_backbone.py::test_tiny_llm_kv_cache_matches_full_sequence
 test/test_models/test_vision_backbone.py::test_tiny_siglip_multiview_forward_backward
