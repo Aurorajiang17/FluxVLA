@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from numbers import Real
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -110,6 +111,10 @@ class DenormalizeLiberoAction:
     mean/std, quantiles, or min_max.
 
     Args:
+        quantile_epsilon (float): Nonnegative finite value added to the
+            quantile range. Defaults to 0.0 for existing behavior; choose
+            1e-6 when matching that normalization convention. Other
+            normalization modes are unaffected.
         norm_stats (str or Dict): Normalization statistics,
             which can be a JSON string or a dictionary
             containing 'mean', 'std', 'q01', 'q99', 'min', and 'max' for each
@@ -147,7 +152,8 @@ class DenormalizeLiberoAction:
                  normalize_gripper_action: bool = True,
                  invert_gripper_action: bool = True,
                  action_norm_mask: List[bool] = None,
-                 clip_normalized_action: bool = False):
+                 clip_normalized_action: bool = False,
+                 quantile_epsilon: float = 0.0):
         if isinstance(norm_stats, str):
             with open(norm_stats, 'r', encoding='utf-8') as f:
                 self.norm_stats = json.load(f)
@@ -161,6 +167,17 @@ class DenormalizeLiberoAction:
         self.invert_gripper_action = invert_gripper_action
         self.action_norm_mask = action_norm_mask
         self.clip_normalized_action = bool(clip_normalized_action)
+        self.quantile_epsilon = self._validate_quantile_epsilon(
+            quantile_epsilon)
+
+    @staticmethod
+    def _validate_quantile_epsilon(value: float) -> float:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError('quantile_epsilon must be a real number')
+        value = float(value)
+        if not np.isfinite(value) or value < 0:
+            raise ValueError('quantile_epsilon must be finite and nonnegative')
+        return value
 
     def __call__(self, data: Dict) -> Dict:
         """Denormalize the data using the provided statistics.
@@ -234,10 +251,13 @@ class DenormalizeLiberoAction:
             mask = np.ones_like(stats['q01'], dtype=bool)  # noqa: E501
         action_high = np.array(stats['q99'])
         action_low = np.array(stats['q01'])
+        action_range = action_high - action_low
+        if self.quantile_epsilon:
+            action_range = action_range + self.quantile_epsilon
         mask = np.array(mask)
         action = np.where(
             mask,
-            0.5 * (normalized_action + 1) * (action_high - action_low) +
+            0.5 * (normalized_action + 1) * action_range +
             action_low,  # noqa: E501
             normalized_action,
         )
@@ -273,6 +293,8 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
     mean/std, quantiles, or min_max.
 
     Args:
+        quantile_epsilon (float): Nonnegative finite value added only to
+            the quantile range; defaults to 0.0 for existing behavior.
         norm_stats (str or Dict): Normalization statistics,
             which can be a JSON string or a dictionary
             containing 'mean', 'std', 'q01', 'q99', 'min', and 'max' for each
@@ -313,7 +335,8 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
                  clip_normalized_action: bool = False,
                  statistic_name: str = 'private',
                  discrete_action_dims: List[int] = None,
-                 discrete_norm_type: str = 'min_max'):
+                 discrete_norm_type: str = 'min_max',
+                 quantile_epsilon: float = 0.0):
         if isinstance(norm_stats, str):
             with open(norm_stats, 'r', encoding='utf-8') as f:
                 self.norm_stats = json.load(f)
@@ -326,6 +349,8 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
         self.action_norm_mask = action_norm_mask
         self.clip_normalized_action = bool(clip_normalized_action)
         self.statistic_name = statistic_name
+        self.quantile_epsilon = self._validate_quantile_epsilon(
+            quantile_epsilon)
         self.discrete_action_dims = (
             list(discrete_action_dims) if discrete_action_dims else None)
         self.discrete_norm_type = discrete_norm_type
@@ -456,14 +481,23 @@ class DenormalizeDeltaAction(DenormalizePrivateAction):
     Quantile/mean-std denormalization is applied first.  Dimensions selected
     by ``delta_action_mask`` are then offset by the current raw robot state;
     unselected dimensions, such as grippers, remain absolute.
+
+    ``preserve_intermediate_dtype=False`` keeps the existing FP32 conversion
+    before state addition. When True, retain the denormalized action and raw
+    state dtypes, using NumPy's in-place addition rules. This does not force
+    FP64; the serving runner still owns the final output dtype conversion.
     """
 
     def __init__(self,
                  delta_action_mask: List[bool],
                  state_permutation: Optional[List[int]] = None,
                  *args,
+                 preserve_intermediate_dtype: bool = False,
                  **kwargs):
         super().__init__(*args, **kwargs)
+        if not isinstance(preserve_intermediate_dtype, bool):
+            raise TypeError('preserve_intermediate_dtype must be a bool')
+        self.preserve_intermediate_dtype = preserve_intermediate_dtype
         self.delta_action_mask = np.asarray(delta_action_mask, dtype=bool)
         if self.delta_action_mask.ndim != 1:
             raise ValueError('delta_action_mask must be one-dimensional')
@@ -480,13 +514,14 @@ class DenormalizeDeltaAction(DenormalizePrivateAction):
                     'exactly once.')
 
     def __call__(self, data: Dict) -> np.ndarray:
-        action = np.asarray(super().__call__(data), dtype=np.float32)
+        dtype = None if self.preserve_intermediate_dtype else np.float32
+        action = np.asarray(super().__call__(data), dtype=dtype)
         state = data.get('state')
         if state is None:
             raise ValueError(
                 'Current raw robot state is required to restore delta '
                 'actions.')
-        state = np.asarray(state, dtype=np.float32)
+        state = np.asarray(state, dtype=dtype)
         if state.ndim == 2 and state.shape[0] == 1:
             state = state[0]
         if state.ndim != 1:
