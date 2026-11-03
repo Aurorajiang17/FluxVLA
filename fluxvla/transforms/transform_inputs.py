@@ -14,6 +14,7 @@
 
 import os
 import random
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 import av
@@ -375,15 +376,24 @@ class ProcessEvalInputs:
         img_keys (List[str]): Image keys to fetch from the inputs.
         embodiment_id (int | None): Optional embodiment id written to
             ``embodiment_ids``.
+        num_padding_imgs (int): Number of black images to append with False
+            masks. Their size matches the first real image. Defaults to 0.
     """
 
     def __init__(self,
                  img_keys: List[str] = None,
-                 embodiment_id: int = None) -> None:
+                 embodiment_id: int = None,
+                 num_padding_imgs: int = 0) -> None:
         if img_keys is None:
             raise ValueError('ProcessEvalInputs requires img_keys')
+        if isinstance(num_padding_imgs,
+                      bool) or not isinstance(num_padding_imgs, int):
+            raise TypeError('num_padding_imgs must be a nonnegative integer')
+        if num_padding_imgs < 0:
+            raise ValueError('num_padding_imgs must be nonnegative')
         self.img_keys = list(img_keys)
         self.embodiment_id = embodiment_id
+        self.num_padding_imgs = num_padding_imgs
 
     def __call__(self, inputs: Dict) -> Dict:
         images = []
@@ -399,12 +409,71 @@ class ProcessEvalInputs:
             image = Image.fromarray(img).convert('RGB')
             images.append(image)
             img_masks.append(True)
+        if self.num_padding_imgs:
+            if not images:
+                raise ValueError('Padding requires at least one real image')
+            for _ in range(self.num_padding_imgs):
+                images.append(Image.new('RGB', images[0].size, (0, 0, 0)))
+                img_masks.append(False)
         inputs['pixel_values'] = images
         inputs['img_masks'] = img_masks
         if self.embodiment_id is not None:
             inputs['embodiment_ids'] = np.array(
                 self.embodiment_id, dtype=np.int32)
         return inputs
+
+
+@TRANSFORMS.register_module()
+class PackModelInputs:
+    """Select named inputs and pack CPU tensors without model-specific fields.
+
+    Args:
+        key_mapping (Mapping[str, str]): Output key to input key mapping.
+        dtypes (Mapping[str, str | torch.dtype]): Explicit dtype for every
+            output key, e.g. 'float32', 'int64', or torch.bool.
+        add_batch_dim (bool): Add a leading singleton batch axis. Defaults
+            to True. Input tensors must already reside on the CPU.
+    """
+
+    def __init__(self, key_mapping, dtypes, add_batch_dim: bool = True):
+        if not isinstance(key_mapping, Mapping) or not key_mapping:
+            raise ValueError('key_mapping must be a nonempty mapping')
+        if any(not isinstance(key, str) or not key
+               for pair in key_mapping.items() for key in pair):
+            raise ValueError('key_mapping keys and values must be nonempty '
+                             'strings')
+        if not isinstance(dtypes, Mapping) or set(dtypes) != set(key_mapping):
+            raise ValueError('dtypes must specify exactly the output keys')
+        if not isinstance(add_batch_dim, bool):
+            raise TypeError('add_batch_dim must be a bool')
+        self.key_mapping = dict(key_mapping)
+        self.dtypes = {}
+        for key, dtype in dtypes.items():
+            if isinstance(dtype, str):
+                dtype = getattr(torch, dtype, None)
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(f'Invalid dtype for output {key!r}')
+            self.dtypes[key] = dtype
+        self.add_batch_dim = add_batch_dim
+
+    def __call__(self, inputs: Dict) -> Dict:
+        packed = {}
+        for output_key, input_key in self.key_mapping.items():
+            if input_key not in inputs:
+                raise KeyError(f'Missing model input: {input_key!r}')
+            value = inputs[input_key]
+            if isinstance(value, torch.Tensor):
+                if value.device.type != 'cpu':
+                    raise ValueError(f'Input {input_key!r} must be on the CPU')
+            else:
+                value = np.asarray(value)
+                if value.dtype.kind not in 'biufc':
+                    raise TypeError(f'Input {input_key!r} must be numeric')
+            tensor = torch.as_tensor(
+                value, dtype=self.dtypes[output_key], device='cpu')
+            packed[output_key] = tensor.unsqueeze(
+                0) if self.add_batch_dim else tensor
+        return packed
 
 
 # === Libero-specific Image Loader Transform ===

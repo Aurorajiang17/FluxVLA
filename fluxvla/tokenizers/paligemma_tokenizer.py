@@ -24,17 +24,18 @@ from fluxvla.engines.utils.download_utils import maybe_download
 
 @TOKENIZERS.register_module()
 class PaligemmaTokenizer:
-    """PaligemmaTokenizer for PaliGemma.
-    This tokenizer is designed to work with the PaliGemma model,
-    which uses a combination of a SentencePiece tokenizer for the
-    prefix and a FAST tokenizer for the actions. The tokenizer
-    handles the tokenization of prompts, states,
-    and actions, and it also provides functionality to
-    extract actions from the tokenized output.
+    """Encode text prompts with the PaliGemma SentencePiece model.
+
+    State formatting belongs to the prompt transform. This tokenizer does
+    not encode or decode actions and does not use FAST.
 
     Args:
-        model_path (str): Path to the PaliGemma tokenizer model.
+        download_path (str): Fallback path or URL for the tokenizer model.
             Defaults to "gs://big_vision/paligemma_tokenizer.model".
+        model_path (str | None): Local model file or saved tokenizer directory.
+        preformatted (bool): Encode the complete prompt with BOS, without
+            cleanup or an appended newline. Defaults to False for legacy
+            prompt handling. Select this mode explicitly when reloading.
     """
 
     def __init__(
@@ -42,7 +43,12 @@ class PaligemmaTokenizer:
             download_path: str = 'gs://big_vision/paligemma_tokenizer.model',
             model_path: str = None,
             *args,
+            preformatted: bool = False,
             **kwargs):
+
+        if not isinstance(preformatted, bool):
+            raise TypeError('preformatted must be a bool')
+        self.preformatted = preformatted
 
         # Evaluation runners pass the checkpoint-local tokenizer directory via
         # ``model_path``.  Prefer that artifact over the remote fallback so a
@@ -61,23 +67,23 @@ class PaligemmaTokenizer:
     def tokenize(self,
                  prompt: str,
                  state: np.ndarray | None = None,
-                 **kwargs) -> tuple[np.ndarray, np.ndarray]:
-        """Tokenize the input prompt, state, and actions.
+                 **kwargs) -> dict[str, list]:
+        """Tokenize a prompt and return unpadded IDs and attention masks.
 
         Args:
             prompt (str): The task prompt to be tokenized.
-            state (np.ndarray | None): The state to be
-                tokenized, expected to be a
-                1D numpy array of continuous values.
+            state (np.ndarray | None): Unused compatibility argument.
             **kwargs: Additional keyword arguments.
 
         Returns:
-            tuple[np.ndarray, np.ndarray]: A tuple containing:
-                - tokens (np.ndarray): The tokenized sequence.
+            dict: ``input_ids`` and ``attention_mask`` lists.
         """
-        cleaned_text = prompt.strip().replace('_', ' ').replace('\n', ' ')
-        tokens = self._tokenizer.encode(
-            cleaned_text, add_bos=True) + self._tokenizer.encode('\n')
+        if self.preformatted:
+            tokens = self._tokenizer.encode(prompt, add_bos=True)
+        else:
+            cleaned_text = prompt.strip().replace('_', ' ').replace('\n', ' ')
+            tokens = self._tokenizer.encode(
+                cleaned_text, add_bos=True) + self._tokenizer.encode('\n')
 
         token_mask = [True] * len(tokens)
         return dict(input_ids=tokens, attention_mask=token_mask)

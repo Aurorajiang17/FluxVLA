@@ -1460,6 +1460,8 @@ class TransformImage:
             converts it only at the PIL call site.
         letterbox_pad_position (Optional[str]): Region where
             letterbox padding is placed.
+        letterbox_resize_rounding (str): Round resized dimensions with 'round'
+            (the default) or 'floor'. Floor rejects zero-sized results.
     """
 
     def __init__(
@@ -1471,8 +1473,13 @@ class TransformImage:
         stds: Optional[List[Tuple[float, float, float]]] = None,
         letterbox_fill: Optional[List[int]] = None,
         letterbox_pad_position: Optional[str] = None,
+        letterbox_resize_rounding: str = 'round',
         **kwargs: str,
     ) -> None:
+        if letterbox_resize_rounding not in ('round', 'floor'):
+            raise ValueError(
+                'letterbox_resize_rounding must be round or floor')
+        self.letterbox_resize_rounding = letterbox_resize_rounding
         self.use_fused_vision_backbone = use_fused_vision_backbone
         self.image_resize_strategy = image_resize_strategy
 
@@ -1627,8 +1634,14 @@ class TransformImage:
         """
         target_width, target_height = self.resize_params[0]['size']
         ratio = max(img.width / target_width, img.height / target_height)
-        new_w = max(1, round(img.width / ratio))
-        new_h = max(1, round(img.height / ratio))
+        if self.letterbox_resize_rounding == 'floor':
+            new_w, new_h = int(img.width / ratio), int(img.height / ratio)
+            if new_w == 0 or new_h == 0:
+                raise ValueError('Floor letterbox resize produced a zero '
+                                 f'dimension: {(new_w, new_h)}')
+        else:
+            new_w = max(1, round(img.width / ratio))
+            new_h = max(1, round(img.height / ratio))
         img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
         if isinstance(fill_color, list):
             fill_color = tuple(fill_color)

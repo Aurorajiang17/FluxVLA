@@ -1003,6 +1003,9 @@ class StateFromInputs:
         state_dim (int | None): Padded output dimension.
         out_key (str): Output key for the normalized state (default
             'states').
+        preserve_input_dtype (bool): Skip the initial FP32 cast and preserve
+            the normalization result dtype during optional padding. Defaults
+            to False. Statistics keep their existing conversion rules.
     """
 
     def __init__(self,
@@ -1011,7 +1014,11 @@ class StateFromInputs:
                  norm_type: str = 'min_max',
                  clip_norm: bool = False,
                  state_dim: int = None,
-                 out_key: str = 'states') -> None:
+                 out_key: str = 'states',
+                 preserve_input_dtype: bool = False) -> None:
+        if not isinstance(preserve_input_dtype, bool):
+            raise TypeError('preserve_input_dtype must be a bool')
+        self.preserve_input_dtype = preserve_input_dtype
         if norm_type not in {'mean_std', 'quantile', 'min_max'}:
             raise ValueError(f'Unsupported norm_type: {norm_type!r}')
         self.state_key = state_key
@@ -1024,7 +1031,9 @@ class StateFromInputs:
     def __call__(self, data: Dict) -> Dict:
         if self.state_key not in data:
             raise KeyError(f'Missing state key: {self.state_key!r}')
-        state = np.asarray(data[self.state_key], dtype=np.float32)
+        state = np.asarray(
+            data[self.state_key],
+            dtype=None if self.preserve_input_dtype else np.float32)
         if state.ndim != 1 or state.size == 0:
             raise ValueError(
                 f'State {self.state_key!r} must be a nonempty 1-D array, '
@@ -1040,7 +1049,9 @@ class StateFromInputs:
             state = np.clip(state, -1.0, 1.0)
         out = dict(data)
         if self.state_dim is not None:
-            padded = np.zeros(self.state_dim, dtype=np.float32)
+            padded = np.zeros(
+                self.state_dim,
+                dtype=state.dtype if self.preserve_input_dtype else np.float32)
             padded[:state.shape[0]] = state
             out[self.out_key] = padded
         else:
