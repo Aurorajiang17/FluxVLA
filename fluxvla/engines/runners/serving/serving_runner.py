@@ -217,11 +217,15 @@ class FluxVLAServingRunner:
     @staticmethod
     def _as_numpy(value: Any) -> np.ndarray:
         if isinstance(value, torch.Tensor):
+            if value.dtype == torch.bool or value.is_complex():
+                raise TypeError('FluxVLA actions must contain real numbers')
             value = value.detach().float().cpu().numpy()
+        _validate_action_type(value)
         return np.asarray(value)
 
     @staticmethod
     def _canonicalize_actions(value: Any) -> np.ndarray:
+        _validate_action_type(value)
         actions = np.asarray(value)
         if actions.ndim == 3:
             if actions.shape[0] != 1:
@@ -235,7 +239,8 @@ class FluxVLAServingRunner:
             raise ValueError('FluxVLA actions must have shape [A], [T, A], or '
                              f'[1, T, A], got {actions.shape}')
         try:
-            actions = np.asarray(actions, dtype=np.float32)
+            with np.errstate(over='ignore'):
+                actions = np.asarray(actions, dtype=np.float32)
         except (TypeError, ValueError) as exc:
             raise ValueError('FluxVLA actions must be numeric') from exc
         if actions.shape[0] == 0 or actions.shape[1] == 0:
@@ -243,6 +248,15 @@ class FluxVLAServingRunner:
         if not np.isfinite(actions).all():
             raise ValueError('FluxVLA returned NaN or infinite actions')
         return actions
+
+
+def _validate_action_type(value: Any) -> None:
+    # Inspect sequences before NumPy can coerce mixed bool/float rows.
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_action_type(item)
+    elif np.asarray(value).dtype.kind not in 'fiu':
+        raise TypeError('FluxVLA actions must contain real numbers')
 
 
 def build_serving_runner_from_config(
