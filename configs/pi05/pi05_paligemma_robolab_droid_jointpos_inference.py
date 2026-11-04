@@ -32,8 +32,10 @@ tensors. For a diagnostic run without autocast, disable both
 model/inference_model.enable_mixed_precision_training and
 themis.server.enable_mixed_precision in the loaded config.
 
-This is an inference recipe. It defines the model service, not RoboLab's
-simulation launcher, task scheduling or evaluation reporting.
+This inference recipe enables local RoboLab evaluation reports. Themis supplies
+the actual task manifest and episode quotas; simulation and scheduling remain
+outside the model service. This does not imply full evaluation or Feishu
+reporting support.
 """
 
 import os
@@ -161,6 +163,10 @@ model = dict(
 inference_model = model.copy()
 
 eval = dict(
+    report_kind='robolab',
+    task_suite_name='robolab',
+    model_family='pi05',
+    num_trials_per_task=1,
     dataset=dict(
         type='RoboLabEvalDataset',
         img_keys=_IMAGE_KEYS,
@@ -236,6 +242,8 @@ themis = dict(
         state_keys=['states'],
         unnorm_key='robolab_droid'),
     server=dict(
+        dataset_section='eval',
+        evaluation_reporting=dict(enabled=True, report_kind='robolab'),
         runner=dict(type='FluxVLAServingRunner'),
         ckpt_path=_CHECKPOINT_PATH,
         norm_stats_path=_STATS_PATH,

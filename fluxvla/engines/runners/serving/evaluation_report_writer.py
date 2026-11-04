@@ -18,7 +18,7 @@ the ZMQ server. A server passes versioned ``run_start``,
 ``episode_start``, ``episode_end`` and ``run_end`` events to
 ``process_event``.  The writer validates ordering, journals
 accepted events, maintains native live progress, and writes the native LIBERO,
-RoboCasa, or RoboDojo result schema selected by the evaluation config.
+RoboCasa, RoboDojo, or RoboLab result schema selected by the evaluation config.
 
 The class deliberately has no transport dependency. Server adapters may
 construct it before binding sockets and later replace the default Overwatch
@@ -55,7 +55,7 @@ LIBERO_SUITE_TASK_COUNTS = {
     'libero_10': 10,
     'libero_90': 90,
 }
-REPORT_KINDS = frozenset({'libero', 'robocasa', 'robodojo'})
+REPORT_KINDS = frozenset({'libero', 'robocasa', 'robodojo', 'robolab'})
 ROBOCASA_GROUP_ORDER = ('Cabinet', 'Drawer', 'Microwave', 'Generalization')
 ROBODOJO_DIMENSION_TASKS = {
     'Generalization': (
@@ -341,7 +341,7 @@ class FluxVLAEvaluationReportWriter:
             for exact task ids. LIBERO additionally requires
             ``task_suite_name``; RoboCasa requires ``task_list``.
         report_kind: Optional explicit ``libero``, ``robocasa``, or
-            ``robodojo`` selector.
+            ``robodojo`` or ``robolab`` selector.
         logger: Optional ``Callable[[str], None]``. Defaults to Overwatch.
         feishu: Optional mapping with ``sheet_url``, ``app_id``, ``app_secret``
             and ``timeout``. Missing credentials retain the native environment
@@ -478,7 +478,7 @@ class FluxVLAEvaluationReportWriter:
                 status = 'running'
             else:
                 status = self._run_end(state, payload)
-                summary_path = self._write_summary_artifacts(state)
+                summary_path = self._write_summary_artifacts(state, payload)
             self._append_event(state, version, event_type, request_id,
                                sequence, payload)
             state.next_sequence += 1
@@ -756,6 +756,9 @@ class FluxVLAEvaluationReportWriter:
                 raise EvaluationEventError(
                     f'payload.score must be <= 1.0, got {score!r}')
         info = _require_mapping(payload.get('info', {}), 'payload.info')
+        native_status = {}
+        if self.report_kind == 'robolab':
+            native_status = self._robolab_native_status(payload, info)
         prediction_metadata = payload.get('prediction_metadata', [])
         if (not isinstance(prediction_metadata, Sequence)
                 or isinstance(prediction_metadata, (str, bytes))):
@@ -784,12 +787,16 @@ class FluxVLAEvaluationReportWriter:
             'model_calls': model_calls,
             'info': info,
             'prediction_metadata': prediction_metadata,
+            **native_status,
         }
         if score is not None:
             result['score'] = score
         state.episodes.append(result)
         state.completed_keys.add(episode_key)
         del state.active_episodes[episode_key]
+        if self.report_kind == 'robolab':
+            self._write_robolab_progress(state)
+            return
         successes = sum(bool(item['success']) for item in state.episodes)
         success_rate = successes / len(state.episodes) * 100
         scores = [
@@ -900,12 +907,220 @@ class FluxVLAEvaluationReportWriter:
             'summary_path': str(summary_path),
         }
 
-    def _write_summary_artifacts(self, state: _RunState) -> Path:
+    def _write_summary_artifacts(self, state: _RunState, end: dict) -> Path:
+        if self.report_kind == 'robolab':
+            return self._write_robolab_summary_artifacts(state, end)
         if self.report_kind == 'robocasa':
             return self._write_robocasa_summary_artifacts(state)
         if self.report_kind == 'robodojo':
             return self._write_robodojo_summary_artifacts(state)
         return self._write_libero_summary_artifacts(state)
+
+    @staticmethod
+    def _robolab_native_status(payload: dict, info: dict) -> dict:
+        """Separate native outcomes from wrapper limits or missing evidence."""
+        if info.get('benchmark', 'robolab') != 'robolab':
+            raise EvaluationEventError(
+                'payload.info.benchmark must be robolab')
+        for name in ('task_id', 'episode_index', 'environment_seed',
+                     'environment_case_index'):
+            if name in info and info[name] != payload.get(name):
+                raise EvaluationEventError(
+                    f'payload.info.{name} does not match episode identity')
+        frozen = info.get('native_frozen')
+        if frozen is not None:
+            frozen = _require_bool(frozen, 'payload.info.native_frozen')
+        native = _require_mapping(
+            info.get('native_result', {}), 'payload.info.native_result')
+        if frozen is True:
+            success = _require_bool(
+                native.get('success'), 'payload.info.native_result.success')
+            _require_int(
+                native.get('step'), 'payload.info.native_result.step', 0)
+            if success != payload['success']:
+                raise EvaluationEventError(
+                    'payload.success conflicts with native_result.success')
+            return {'native_final': True, 'unscored_reason': None}
+        if native.get('success') is not None or native.get('step') is not None:
+            raise EvaluationEventError(
+                'native_result requires native_frozen=true')
+        if payload['success']:
+            raise EvaluationEventError(
+                'payload.success requires a frozen native success result')
+        return {
+            'native_final':
+            False,
+            'unscored_reason': ('native_not_frozen' if frozen is False else
+                                'missing_native_evidence'),
+        }
+
+    @staticmethod
+    def _robolab_stats(episodes: Sequence[dict], planned: int) -> dict:
+        native = [episode for episode in episodes if episode['native_final']]
+        successes = sum(episode['success'] for episode in native)
+        return {
+            'planned_episodes':
+            planned,
+            'completed_episodes':
+            len(episodes),
+            'native_episodes':
+            len(native),
+            'unscored_episodes':
+            len(episodes) - len(native),
+            'missing_episodes':
+            planned - len(episodes),
+            'successes':
+            successes,
+            'failures':
+            len(native) - successes,
+            'success_rate_pct':
+            (100.0 * successes / len(native) if native else None),
+            'plan_complete':
+            len(episodes) == planned,
+            'results_complete':
+            len(native) == planned,
+            'duration_s':
+            sum(item['duration_s'] for item in episodes),
+        }
+
+    def _write_robolab_progress(self, state: _RunState) -> None:
+        stats = self._robolab_stats(state.episodes,
+                                    state.start['total_episodes'])
+        _write_json_atomic(state.run_dir / 'rank_progress' / 'rank0.json', {
+            'rank': 0,
+            'episodes': len(state.episodes),
+            **stats,
+        })
+        rate = stats['success_rate_pct']
+        rate_text = 'N/A' if rate is None else f'{rate:.2f}%'
+        message = (f"[eval-progress] episodes={stats['completed_episodes']}/"
+                   f"{stats['planned_episodes']} "
+                   f"native_episodes={stats['native_episodes']} "
+                   f"unscored_episodes={stats['unscored_episodes']} "
+                   f"successes={stats['successes']} success_rate={rate_text}")
+        self._append_log(state, message + '\n')
+        self._log(message)
+
+    def _write_robolab_summary_artifacts(self, state: _RunState,
+                                         end: dict) -> Path:
+        """Write local reports without importing RoboLab or reading HDF5."""
+        grouped = defaultdict(list)
+        for episode in state.episodes:
+            grouped[episode['task_id']].append(episode)
+        task_stats = {}
+        manifest = []
+        incomplete_tasks = []
+        status_dir = state.run_dir / 'task_status'
+        status_dir.mkdir(exist_ok=True)
+        for index in sorted(state.tasks_by_index):
+            task = state.tasks_by_index[index]
+            episodes = sorted(
+                grouped[task.task_id], key=lambda item: item['episode_index'])
+            entry = {
+                'task_id': task.task_id,
+                'task_index': index,
+                'description': task.description,
+                'metadata': task.metadata,
+            }
+            manifest.append(entry)
+            stats = self._robolab_stats(episodes,
+                                        self._episodes_for_task(state, task))
+            task_stats[task.task_id] = {'task_index': index, **stats}
+            _write_json_atomic(
+                state.run_dir / 'robolab' / f'task{index}_results.json', {
+                    **entry,
+                    **stats,
+                    'episodes': episodes,
+                })
+            if not stats['results_complete']:
+                incomplete_tasks.append(index)
+            # COMPLETE describes quota/evidence coverage, not policy success.
+            status = 'COMPLETE' if stats['results_complete'] else 'PARTIAL'
+            (status_dir / f'robolab_task{index}.status').write_text(
+                f"{status}|{stats['successes']}|{stats['native_episodes']}|"
+                f"{stats['planned_episodes']}",
+                encoding='utf-8')
+
+        overall = self._robolab_stats(state.episodes,
+                                      state.start['total_episodes'])
+        complete = (
+            end['status'].lower() == 'finished'
+            and overall['results_complete'])
+        summary = {
+            'report_schema_version': '1.0',
+            'benchmark': 'robolab',
+            'run_id': state.run_id,
+            'run_session_id': state.run_session_id,
+            'ckpt': self.ckpt_path,
+            'config': self.config_path,
+            'model_family': self.model_family,
+            'action_order': self.action_order,
+            'status': end['status'].lower(),
+            'finished_at': end['finished_at'],
+            'duration_s': end['duration_s'],
+            'error': end.get('error'),
+            'report_complete': complete,
+            # Runtime selections alone cannot prove full benchmark coverage.
+            'full_suite': None,
+            'native_artifacts_verified': False,
+            'success_rate_basis': 'frozen_native_episodes',
+            'run_plan': state.start,
+            'task_manifest': manifest,
+            'task_stats': task_stats,
+            'overall': overall,
+        }
+        columns = list(overall)
+        with (state.run_dir / 'summary.csv').open(
+                'w', newline='', encoding='utf-8') as stream:
+            writer = csv.DictWriter(
+                stream, fieldnames=['status', 'report_complete', *columns])
+            writer.writeheader()
+            writer.writerow({
+                'status': summary['status'],
+                'report_complete': complete,
+                **overall,
+            })
+        with (state.run_dir / 'task_success_rates.csv').open(
+                'w', newline='', encoding='utf-8') as stream:
+            writer = csv.DictWriter(
+                stream, fieldnames=['task_id', 'task_index', *columns])
+            writer.writeheader()
+            for task_id, stats in task_stats.items():
+                writer.writerow({'task_id': task_id, **stats})
+
+        rate = overall['success_rate_pct']
+        rate_text = 'N/A' if rate is None else f'{rate:.2f}%'
+        text_lines = [
+            '=== RoboLab Evaluation Results Summary ===',
+            f"Run status: {summary['status']}",
+            f'Report complete: {complete}',
+            f"Accepted episodes: {overall['completed_episodes']}/"
+            f"{overall['planned_episodes']}",
+            f"Frozen native episodes: {overall['native_episodes']}",
+            f"Unscored episodes: {overall['unscored_episodes']}",
+            f"Missing episodes: {overall['missing_episodes']}",
+            f"Successes: {overall['successes']}",
+            f"Native failures: {overall['failures']}",
+            f'Success rate (frozen native episodes only): {rate_text}',
+            'Full benchmark coverage: unverified',
+            'Native artifact paths: recorded, not verified on this host',
+        ]
+        if not complete:
+            text_lines.append('Partial results; not a complete evaluation.')
+        if summary['error'] is not None:
+            text_lines.append('Error: ' +
+                              json.dumps(summary['error'], ensure_ascii=False))
+        (state.run_dir / 'summary.txt').write_text(
+            '\n'.join(text_lines) + '\n', encoding='utf-8')
+        # Preserve the familiar filename, explicitly document its meaning.
+        (state.run_dir / 'failed_tasks.txt').write_text(
+            ''.join(f'{index}\n' for index in incomplete_tasks),
+            encoding='utf-8')
+        summary_path = state.run_dir / 'summary.json'
+        _write_json_atomic(summary_path, summary)
+        self._log(f'[zmq-eval] wrote RoboLab summary artifacts to '
+                  f'{state.run_dir}')
+        return summary_path
 
     def _write_libero_summary_artifacts(self, state: _RunState) -> Path:
         grouped = defaultdict(list)
@@ -1637,6 +1852,8 @@ class FluxVLAEvaluationReportWriter:
 
     def _feishu_eligibility(self, state: _RunState,
                             end: dict) -> tuple[bool, str]:
+        if self.report_kind == 'robolab':
+            return False, 'RoboLab supports local reports only'
         if end['status'].lower() != 'finished':
             return False, 'run status is not finished'
         if self.expected_task_indexes is None:
