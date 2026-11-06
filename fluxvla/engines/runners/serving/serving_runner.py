@@ -8,6 +8,7 @@ import random
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,8 @@ class FluxVLAServingRunner:
                  model_outputs_environment_actions: bool = False,
                  denormalize_context: Mapping[str, Any] | None = None,
                  denormalize_per_action: bool = False,
-                 expected_unnorm_key: str = '') -> None:
+                 expected_unnorm_key: str = '',
+                 sampling_mode: str = 'legacy_episode') -> None:
         if not callable(dataset):
             raise TypeError('FluxVLA server dataset must be callable')
         if (not model_outputs_environment_actions
@@ -62,6 +64,11 @@ class FluxVLAServingRunner:
             raise TypeError('denormalize_context must be a mapping')
         if not isinstance(expected_unnorm_key, str):
             raise TypeError('expected_unnorm_key must be a string')
+        if sampling_mode not in {'legacy_episode', 'episode_noise_stream_v1'}:
+            raise ValueError('Unsupported sampling_mode')
+        if (sampling_mode == 'episode_noise_stream_v1' and getattr(
+                vla, 'supports_noise_generator', False) is not True):
+            raise ValueError('Model must explicitly support noise_generator')
 
         self.vla = vla
         self.dataset = dataset
@@ -75,6 +82,7 @@ class FluxVLAServingRunner:
         self.denormalize_context = dict(denormalize_context or {})
         self.denormalize_per_action = denormalize_per_action
         self.expected_unnorm_key = expected_unnorm_key
+        self.sampling_mode = sampling_mode
         if self.device.type == 'cuda':
             torch.cuda.set_device(self.device)
         self.vla.eval()
@@ -86,6 +94,62 @@ class FluxVLAServingRunner:
     def predict_action(self, observation: Mapping[str, Any], unnorm_key: str,
                        policy_seed: int) -> tuple[np.ndarray, float]:
         """Process one self-contained request and return ``[T, A]`` actions."""
+        actions, elapsed, _ = self._predict_action(observation, unnorm_key,
+                                                   policy_seed)
+        return actions, elapsed
+
+    def predict_action_with_sampling_state(
+            self,
+            observation: Mapping[str, Any],
+            unnorm_key: str,
+            policy_seed: int,
+            sequence: int,
+            rng_state: bytes | None = None,
+            rng_format: str | None = None
+    ) -> tuple[np.ndarray, float, bytes, str]:
+        """Advance a caller-owned noise stream without worker affinity."""
+        if self.sampling_mode != 'episode_noise_stream_v1':
+            raise ValueError('Runner does not enable episode_noise_stream_v1')
+        if isinstance(sequence, bool) or not isinstance(sequence, Integral):
+            raise TypeError('sequence must be an integer')
+        if sequence < 1:
+            raise ValueError('sequence must be positive')
+        generator = torch.Generator(device=self.device)
+        state_size = generator.get_state().numel()
+        expected_format = (
+            f'torch={torch.__version__};device={self.device.type};'
+            f'cuda={torch.version.cuda};bytes={state_size}')
+        if sequence == 1:
+            if rng_state is not None or rng_format is not None:
+                raise ValueError('First request must not carry old RNG state')
+        else:
+            if not isinstance(rng_state, bytes):
+                raise TypeError('Later requests require bytes rng_state')
+            if len(rng_state) != state_size or len(rng_state) > 65536:
+                raise ValueError('Invalid RNG state length')
+            if rng_format != expected_format:
+                raise ValueError('Incompatible RNG format or runtime')
+            try:
+                generator.set_state(
+                    torch.from_numpy(
+                        np.frombuffer(rng_state, dtype=np.uint8).copy()))
+            except RuntimeError as exc:
+                raise ValueError('Invalid RNG state') from exc
+        actions, elapsed, generator = self._predict_action(
+            observation,
+            unnorm_key,
+            policy_seed,
+            generator,
+            initialize_noise_stream=sequence == 1)
+        return (actions, elapsed, generator.get_state().numpy().tobytes(),
+                expected_format)
+
+    def _predict_action(self,
+                        observation,
+                        unnorm_key,
+                        policy_seed,
+                        noise_generator=None,
+                        initialize_noise_stream=False):
         if not isinstance(observation, Mapping):
             raise TypeError('observation must be a mapping')
         if (unnorm_key and self.expected_unnorm_key
@@ -107,6 +171,15 @@ class FluxVLAServingRunner:
             batch['unnorm_key'] = unnorm_key
         batch['seed'] = int(policy_seed)
         batch = self._move_to_device(batch)
+        if noise_generator is not None:
+            if initialize_noise_stream:
+                # Match the legacy/B first sample after preprocessing, rather
+                # than assuming preprocessing never consumes Torch randomness.
+                state = (
+                    torch.cuda.get_rng_state(self.device)
+                    if self.device.type == 'cuda' else torch.get_rng_state())
+                noise_generator.set_state(state)
+            batch['noise_generator'] = noise_generator
 
         if self.device.type == 'cuda':
             torch.cuda.synchronize(self.device)
@@ -127,7 +200,7 @@ class FluxVLAServingRunner:
             raw_actions,
             unnorm_key=unnorm_key,
             request_context=request_context)
-        return actions, inference_time_s
+        return actions, inference_time_s, noise_generator
 
     @staticmethod
     def _seed_policy_rngs(policy_seed: int) -> None:

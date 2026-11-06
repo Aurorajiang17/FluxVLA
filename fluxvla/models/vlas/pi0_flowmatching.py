@@ -237,11 +237,14 @@ class PI0FlowMatching(BaseVLA):
                    for selector in self.params_to_change_dtype):
                 param.data = param.data.to(dtype=torch.bfloat16)
 
-    def sample_noise(self, shape, device):
+    supports_noise_generator = True
+
+    def sample_noise(self, shape, device, generator=None):
         noise = torch.normal(
             mean=0.0,
             std=1.0,
             size=shape,
+            generator=generator,
             dtype=torch.float32,
             device=device,
         )
@@ -837,13 +840,18 @@ class PI0FlowMatching(BaseVLA):
                        prev_actions=None,
                        prefix_len: int = 0,
                        rtc_config: dict = None,
+                       noise_generator: Optional[torch.Generator] = None,
                        *args,
                        **kwargs):
         device = states.device
         bsize = states.shape[0]
         if noise is None:
             actions_shape = (bsize, self.n_action_steps, self.max_action_dim)
-            noise = self.sample_noise(actions_shape, device)
+            if noise_generator is None:
+                noise = self.sample_noise(actions_shape, device)
+            else:
+                noise = self.sample_noise(
+                    actions_shape, device, generator=noise_generator)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images=images,

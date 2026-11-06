@@ -955,10 +955,14 @@ class FluxVLAEvaluationReportWriter:
         }
 
     @staticmethod
-    def _robolab_stats(episodes: Sequence[dict], planned: int) -> dict:
+    def _robolab_stats(episodes: Sequence[dict],
+                       planned: int,
+                       intervals: bool = True) -> dict:
+        from .robolab_statistics import summarize_metrics
         native = [episode for episode in episodes if episode['native_final']]
         successes = sum(episode['success'] for episode in native)
         return {
+            **summarize_metrics(native, planned, intervals=intervals),
             'planned_episodes':
             planned,
             'completed_episodes':
@@ -984,8 +988,8 @@ class FluxVLAEvaluationReportWriter:
         }
 
     def _write_robolab_progress(self, state: _RunState) -> None:
-        stats = self._robolab_stats(state.episodes,
-                                    state.start['total_episodes'])
+        stats = self._robolab_stats(
+            state.episodes, state.start['total_episodes'], intervals=False)
         _write_json_atomic(state.run_dir / 'rank_progress' / 'rank0.json', {
             'rank': 0,
             'episodes': len(state.episodes),
@@ -1001,9 +1005,22 @@ class FluxVLAEvaluationReportWriter:
         self._append_log(state, message + '\n')
         self._log(message)
 
+        if state.episodes:
+            last = state.episodes[-1]
+            metrics = last.get('info', {}).get('metrics', {})
+            detail = (
+                f"[episode-metrics] task={last['task_id']} "
+                f"episode={last['episode_index']} success={last['success']} "
+                f"score={last.get('score')} steps={last['steps']} "
+                f"ee_speed_m_s={metrics.get('ee_speed_mean')} "
+                f"ee_sparc={metrics.get('ee_sparc')}")
+            self._append_log(state, detail + '\n')
+            self._log(detail)
+
     def _write_robolab_summary_artifacts(self, state: _RunState,
                                          end: dict) -> Path:
         """Write local reports without importing RoboLab or reading HDF5."""
+        from .robolab_statistics import METRIC_NAMES, STATISTICAL_PROTOCOL
         grouped = defaultdict(list)
         for episode in state.episodes:
             grouped[episode['task_id']].append(episode)
@@ -1047,7 +1064,10 @@ class FluxVLAEvaluationReportWriter:
             end['status'].lower() == 'finished'
             and overall['results_complete'])
         summary = {
-            'report_schema_version': '1.0',
+            'report_schema_version': '1.1',
+            'statistical_protocol': STATISTICAL_PROTOCOL,
+            'metrics_report_complete': complete
+            and overall['metrics_complete'],
             'benchmark': 'robolab',
             'run_id': state.run_id,
             'run_session_id': state.run_session_id,
@@ -1088,6 +1108,24 @@ class FluxVLAEvaluationReportWriter:
             for task_id, stats in task_stats.items():
                 writer.writerow({'task_id': task_id, **stats})
 
+        episode_columns = [
+            'task_id', 'episode_id', 'episode_index', 'policy_seed', 'success',
+            'native_final', 'score', 'steps', 'duration_s', 'control_dt_s',
+            'simulation_duration_s', 'metrics_compute_s', 'native_hdf5_path',
+            'native_demo_key', 'native_batch_lane', 'metrics_complete',
+            *METRIC_NAMES
+        ]
+        with (state.run_dir / 'episodes.csv').open(
+                'w', newline='', encoding='utf-8') as stream:
+            writer = csv.DictWriter(stream, fieldnames=episode_columns)
+            writer.writeheader()
+            for episode in state.episodes:
+                info = episode.get('info', {})
+                values = {**episode, **info, **info.get('metrics', {})}
+                writer.writerow(
+                    {name: values.get(name)
+                     for name in episode_columns})
+
         rate = overall['success_rate_pct']
         rate_text = 'N/A' if rate is None else f'{rate:.2f}%'
         text_lines = [
@@ -1102,6 +1140,14 @@ class FluxVLAEvaluationReportWriter:
             f"Successes: {overall['successes']}",
             f"Native failures: {overall['failures']}",
             f'Success rate (frozen native episodes only): {rate_text}',
+            f"Score /100: {overall['score_mean_pct']}",
+            f"Score 95% task bootstrap CI: [{overall['score_ci95_low_pct']}, "
+            f"{overall['score_ci95_high_pct']}]",
+            'EE Speed cm/s (mean +/- population SD): '
+            f"{overall['ee_speed_cm_s']} "
+            f"+/- {overall['ee_speed_sd_cm_s']}",
+            f"EE SPARC: {overall['ee_sparc']}",
+            f"Metrics complete: {overall['metrics_complete']}",
             'Full benchmark coverage: unverified',
             'Native artifact paths: recorded, not verified on this host',
         ]

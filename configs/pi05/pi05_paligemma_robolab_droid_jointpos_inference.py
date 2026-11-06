@@ -244,7 +244,9 @@ themis = dict(
     server=dict(
         dataset_section='eval',
         evaluation_reporting=dict(enabled=True, report_kind='robolab'),
-        runner=dict(type='FluxVLAServingRunner'),
+        runner=dict(
+            type='FluxVLAServingRunner',
+            sampling_mode='episode_noise_stream_v1'),
         ckpt_path=_CHECKPOINT_PATH,
         norm_stats_path=_STATS_PATH,
         device='cuda:0',

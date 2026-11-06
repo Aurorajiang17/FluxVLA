@@ -14,7 +14,7 @@ import traceback
 import uuid
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ class _PendingPrediction:
     unnorm_key: str
     payload: bytes
     deadline: float
+    sampling_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -219,6 +220,7 @@ class FluxVLAInferenceServer:
             unnorm_key=unnorm_key,
             payload=payload,
             deadline=time.monotonic() + timeout_s,
+            sampling_context=_sampling_context(header),
         )
         self._pending_predictions.append(pending)
         self._predictions_by_id[request_id] = pending
@@ -353,6 +355,7 @@ class FluxVLAInferenceServer:
                 policy_seed=pending.policy_seed,
                 unnorm_key=pending.unnorm_key,
                 payload=pending.payload,
+                **pending.sampling_context,
             )
 
     def _next_idle_worker(self) -> _ModelWorker | None:
@@ -530,23 +533,17 @@ def run_model_worker(config_path: str,
         request_id = _required_string(header, 'request_id')
         payload = frames[1] if len(frames) > 1 else empty_payload()
         try:
-            observation = decode_frame(payload)
-            if not isinstance(observation, Mapping):
-                raise TypeError('prediction payload must be a mapping')
-            actions, inference_time_s = runner.predict_action(
-                observation,
-                unnorm_key=str(header.get('unnorm_key', '')),
-                policy_seed=_required_int(header, 'policy_seed'),
-            )
-            actions = np.asarray(actions, dtype=np.float32)
+            result, inference_time_s, sampling_response = _predict_request(
+                runner, header, payload)
             backend.send_multipart([
                 encode_header(
                     'predict_result',
                     **common,
                     request_id=request_id,
                     inference_time_s=float(inference_time_s),
+                    **sampling_response,
                 ),
-                encode_frame({'actions': actions}),
+                encode_frame(result),
             ])
         except Exception as exc:
             print(
@@ -565,6 +562,56 @@ def run_model_worker(config_path: str,
                 ),
                 empty_payload(),
             ])
+
+
+def _sampling_context(header: Mapping[str, Any]) -> dict[str, Any]:
+    mode = header.get('sampling_mode', 'legacy_episode')
+    if mode not in {'legacy_episode', 'episode_noise_stream_v1'}:
+        raise ValueError('Unsupported sampling_mode')
+    context = {'sampling_mode': mode}
+    if mode == 'episode_noise_stream_v1':
+        sequence = _required_int(header, 'sequence')
+        if sequence < 1:
+            raise ValueError('sequence must be positive')
+        state = header.get('rng_state')
+        if state is not None and (not isinstance(state, bytes)
+                                  or not 0 < len(state) <= 65536):
+            raise ValueError('rng_state must be bounded bytes')
+        context.update(
+            episode_id=_required_string(header, 'episode_id'),
+            sequence=sequence,
+            rng_state=state,
+            rng_format=header.get('rng_format'))
+    return context
+
+
+def _predict_request(runner, header, payload):
+    """Execute the same protocol in a worker or a CPU transport test."""
+    observation = decode_frame(payload)
+    if not isinstance(observation, Mapping):
+        raise TypeError('prediction payload must be a mapping')
+    sampling = _sampling_context(header)
+    mode = sampling['sampling_mode']
+    if mode != runner.sampling_mode:
+        raise ValueError('Client and model sampling_mode do not match')
+    args = (observation, str(header.get('unnorm_key', '')),
+            _required_int(header, 'policy_seed'))
+    response = {}
+    result = {}
+    if mode == 'episode_noise_stream_v1':
+        predict = runner.predict_action_with_sampling_state
+        actions, elapsed, state, fmt = predict(*args, sampling['sequence'],
+                                               sampling['rng_state'],
+                                               sampling['rng_format'])
+        response.update(
+            sampling_mode=mode,
+            episode_id=sampling['episode_id'],
+            sequence=sampling['sequence'])
+        result.update(rng_state=state, rng_format=fmt)
+    else:
+        actions, elapsed = runner.predict_action(*args)
+    result['actions'] = np.asarray(actions, dtype=np.float32)
+    return result, elapsed, response
 
 
 def build_evaluation_report_writer_from_config(
