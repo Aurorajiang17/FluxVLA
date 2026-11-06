@@ -90,6 +90,18 @@ RoboDojo 完整评测覆盖 42 个基准任务：30 个独立任务各进行 50 
 | FluxVLA(PI0)          |                   [5.96 / 3.37%](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi0_paligemma_robodojo_full_finetune_bs256) |       13.05 / 9.67% |         0.78 / 0.00% |   7.62 / 4.00% |  11.76 / 6.00% | 3.52 / 2.00% | 0.00 / 0.00% |
 | FluxVLA(PI0.5)        |                 [13.61 / 8.83%](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi05_paligemma_robodojo_full_finetune_bs256) |      22.65 / 16.00% |         6.25 / 2.33% | 18.28 / 10.25% | 28.04 / 18.75% | 5.10 / 4.00% | 2.20 / 2.00% |
 
+#### RoboLab
+
+评测覆盖120个DROID任务，包括每任务1个episode的开发检查和**故障恢复的每任务10个episode评测**。Score采用原生最终得分，展示为0–100；EE Speed为各episode速度的均值±总体标准差，不含推理等待。EE SPARC采用原生轨迹平滑度指标。
+
+| 模型                                                                                   | 协议 / 回合数      | SR (%) | Score /100 | EE Speed (cm/s) | EE SPARC |
+| -------------------------------------------------------------------------------------- | ------------------ | -----: | ---------: | --------------: | -------: |
+| [FluxVLA(PI0.5)](configs/pi05/pi05_paligemma_robolab_droid_jointpos_inference.py)      | 开发检查：120 × 1  |  27.50 |      41.76 |     5.45 ± 1.54 |    −7.13 |
+| [FluxVLA(PI0.5)](configs/pi05/pi05_paligemma_robolab_droid_jointpos_inference.py)      | 故障恢复：120 × 10 |  26.42 |      40.56 |     5.43 ± 1.54 |    −7.44 |
+| [官方π0.5参考](https://research.nvidia.com/labs/srl/projects/robolab/leaderboard.html) | 榜单：120 × 10     |  28.00 |      43.40 |     5.35 ± 1.59 |    −8.34 |
+
+两次评测均采用RoboLab `9cce00ca`、回合内连续噪声与回合间独立seed，以及加载后775个FP32＋37个BF16参数张量和BF16 autocast（权重文件保存812个FP32张量）。恢复评测使用6张RTX PRO 5000 72GB GPU、6个模型worker和6个仿真worker，每个仿真worker含10个原生环境。继承600回合并新测600回合，最终317/1200成功；SR的95%区间为\[23.94, 29.01\]%，Score区间为\[34.77, 46.45\]。此前仿真数值异常的根因尚未解决。官方参考采用RoboLab `09545754`和L40S；条件存在差异，区间重叠不证明统计等效。恢复来源、指标及验证限制见[FluxThemis RoboLab文档](https://github.com/FluxVLA/FluxThemis/blob/main/docs/robolab.md#fault-recovered-120-x-10-evaluation)。
+
 #### RoboTwin
 
 我们采用多任务训练设置，该设置也被 [Motus](https://arxiv.org/html/2512.13030v1#S5.SS2)、[LingBot-VA](https://arxiv.org/html/2601.21998v2#S4.SS3.SSS2) 和 [StarVLA](https://arxiv.org/html/2604.05014v1#S5.SS4) 使用：使用每个任务的 50 条 clean 和 500 条 randomized 示范，在全部 50 个任务上联合训练一个策略。这与原始 RoboTwin 基准使用每个任务 50 条 clean 示范进行单任务训练的设置不同。

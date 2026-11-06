@@ -90,6 +90,18 @@ RoboDojo の完全評価は 42 個のベンチマークタスクで構成され�
 | FluxVLA(PI0)          |                   [5.96 / 3.37%](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi0_paligemma_robodojo_full_finetune_bs256) |       13.05 / 9.67% |             0.78 / 0.00% |   7.62 / 4.00% |  11.76 / 6.00% | 3.52 / 2.00% |   0.00 / 0.00% |
 | FluxVLA(PI0.5)        |                 [13.61 / 8.83%](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi05_paligemma_robodojo_full_finetune_bs256) |      22.65 / 16.00% |             6.25 / 2.33% | 18.28 / 10.25% | 28.04 / 18.75% | 5.10 / 4.00% |   2.20 / 2.00% |
 
+#### RoboLab
+
+120個のDROIDタスクについて、各タスク1エピソードの開発チェックと、**障害復旧を伴う各タスク10エピソードの評価**を実施しました。Scoreはネイティブの最終スコアを0–100で表示します。EE Speedはエピソードごとの速度の平均±母標準偏差で、推論待ち時間を含みません。EE SPARCはネイティブの軌道平滑度指標です。
+
+| モデル                                                                                    | プロトコル / エピソード数 | SR (%) | Score /100 | EE Speed (cm/s) | EE SPARC |
+| ----------------------------------------------------------------------------------------- | ------------------------- | -----: | ---------: | --------------: | -------: |
+| [FluxVLA(PI0.5)](configs/pi05/pi05_paligemma_robolab_droid_jointpos_inference.py)         | 開発チェック：120 × 1     |  27.50 |      41.76 |     5.45 ± 1.54 |    −7.13 |
+| [FluxVLA(PI0.5)](configs/pi05/pi05_paligemma_robolab_droid_jointpos_inference.py)         | 障害復旧：120 × 10        |  26.42 |      40.56 |     5.43 ± 1.54 |    −7.44 |
+| [公式pi0.5参考値](https://research.nvidia.com/labs/srl/projects/robolab/leaderboard.html) | リーダーボード：120 × 10  |  28.00 |      43.40 |     5.35 ± 1.59 |    −8.34 |
+
+両評価はRoboLab `9cce00ca`、エピソード内で連続するノイズと各エピソードの独立seed、ロード後775個のFP32＋37個のBF16パラメータテンソルとBF16 autocastを使用しました（チェックポイントは812個のFP32テンソルを保存）。復旧評価はRTX PRO 5000 72GB GPUを6枚、モデルworkerとシミュレータworkerを各6個使用し、各シミュレータは10個のネイティブ環境を実行しました。既存600エピソードと新規600エピソードを合わせて317/1200成功、SRの95%区間は\[23.94, 29.01\]%、Scoreは\[34.77, 46.45\]です。以前のシミュレーション数値異常の根本原因は未解決です。公式参考値はRoboLab `09545754`とL40Sを使用し、条件の違いがあり、区間の重なりは統計的同等性を証明しません。復旧の来歴、指標、検証範囲は[FluxThemis RoboLabドキュメント](https://github.com/FluxVLA/FluxThemis/blob/main/docs/robolab.md#fault-recovered-120-x-10-evaluation)を参照してください。
+
 #### RoboTwin
 
 [Motus](https://arxiv.org/html/2512.13030v1#S5.SS2)、[LingBot-VA](https://arxiv.org/html/2601.21998v2#S4.SS3.SSS2)、[StarVLA](https://arxiv.org/html/2604.05014v1#S5.SS4) でも採用されているマルチタスク学習設定を使用します。各タスクの clean デモ 50 件と randomized デモ 500 件を用いて、全 50 タスクで単一のポリシーを共同学習します。これは、各タスクの clean デモ 50 件で単一タスク学習を行う元の RoboTwin ベンチマークの設定とは異なります。

@@ -92,6 +92,18 @@ The full RoboDojo evaluation covers 42 benchmark tasks. Each of the 30 standalon
 | FluxVLA(PI0)          |                   [5.96 / 3.37%](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi0_paligemma_robodojo_full_finetune_bs256) |  13.05 / 9.67% | 0.78 / 0.00% |   7.62 / 4.00% |  11.76 / 6.00% | 3.52 / 2.00% | 0.00 / 0.00% |
 | FluxVLA(PI0.5)        |                 [13.61 / 8.83%](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi05_paligemma_robodojo_full_finetune_bs256) | 22.65 / 16.00% | 6.25 / 2.33% | 18.28 / 10.25% | 28.04 / 18.75% | 5.10 / 4.00% | 2.20 / 2.00% |
 
+#### RoboLab
+
+Evaluation covers 120 DROID tasks: a one-episode-per-task development check and a **fault-recovered ten-episode-per-task evaluation**. Native final Score is shown on a 0–100 scale; EE Speed is the mean ± population standard deviation of episode speeds and excludes inference waiting. EE SPARC is the native trajectory smoothness metric.
+
+| Model                                                                                              | Protocol / Episodes        | SR (%) | Score /100 | EE Speed (cm/s) | EE SPARC |
+| -------------------------------------------------------------------------------------------------- | -------------------------- | -----: | ---------: | --------------: | -------: |
+| [FluxVLA(PI0.5)](configs/pi05/pi05_paligemma_robolab_droid_jointpos_inference.py)                  | Development check: 120 × 1 |  27.50 |      41.76 |     5.45 ± 1.54 |    −7.13 |
+| [FluxVLA(PI0.5)](configs/pi05/pi05_paligemma_robolab_droid_jointpos_inference.py)                  | Fault-recovered: 120 × 10  |  26.42 |      40.56 |     5.43 ± 1.54 |    −7.44 |
+| [Official pi0.5 reference](https://research.nvidia.com/labs/srl/projects/robolab/leaderboard.html) | Leaderboard: 120 × 10      |  28.00 |      43.40 |     5.35 ± 1.59 |    −8.34 |
+
+Both runs use RoboLab `9cce00ca`, independent episode seeds with continuous within-episode noise, and BF16 autocast over 775 FP32 plus 37 BF16 loaded parameter tensors (the checkpoint stores 812 FP32 tensors). The recovered run used six RTX PRO 5000 72GB GPUs, six model workers and six simulator workers with ten native environments each. It combines 600 preserved episodes with 600 newly evaluated episodes: 317/1200 successes, SR 95% CI \[23.94, 29.01\]%, Score CI \[34.77, 46.45\]. Earlier simulation numerical faults remain unresolved. The official reference uses RoboLab `09545754` and L40S; these conditions differ and interval overlap does not establish equivalence. See the [FluxThemis RoboLab documentation](https://github.com/FluxVLA/FluxThemis/blob/main/docs/robolab.md#fault-recovered-120-x-10-evaluation) for provenance, metrics and validation limits.
+
 #### RoboTwin
 
 We use a multi-task training setting also adopted by
