@@ -136,6 +136,27 @@ class _Run:
         return summary, directory, response
 
 
+def test_episode_csv_identifies_native_batch_demos(tmp_path):
+    run = _Run(tmp_path, counts={'task-a': 3}).start()
+    for index in range(3):
+        start = run.episode_start('task-a', index)
+        end = run.end_payload(start)
+        end['info']['native_hdf5_path'] = '/native/run_0.hdf5'
+        if index < 2:
+            end['info'].update(
+                native_demo_key=f'demo_{index}', native_batch_lane=index)
+        run.send('episode_end', end)
+        run.completed += 1
+    _, directory, _ = run.finish()
+    with (directory / 'episodes.csv').open(newline='') as stream:
+        rows = list(csv.DictReader(stream))
+    assert [(r['native_hdf5_path'], r['native_demo_key'])
+            for r in rows[:2]] == [('/native/run_0.hdf5', 'demo_0'),
+                                   ('/native/run_0.hdf5', 'demo_1')]
+    assert [r['native_batch_lane'] for r in rows] == ['0', '1', '']
+    assert rows[2]['native_demo_key'] == ''
+
+
 def test_robolab_weighted_counts_files_and_provenance(tmp_path, monkeypatch):
 
     def no_upload(*args, **kwargs):
@@ -407,3 +428,35 @@ def test_existing_benchmark_summary_paths_remain_available(tmp_path, kind):
     assert (directory / 'summary.csv').is_file()
     assert (directory / 'summary.txt').is_file()
     assert 'report_complete' not in summary  # No new RoboLab schema leakage.
+
+
+def test_terminal_metrics_reach_episode_csv_and_leaderboard_summary(tmp_path):
+    from fluxvla.engines.runners.serving.robolab_statistics import METRIC_NAMES
+    run = _Run(tmp_path, counts={'task': 1}).start()
+    start = run.episode_start('task', 0)
+    end = run.end_payload(start, False)
+    end['score'] = 0.5
+    end['info'].update(
+        metrics={
+            **dict.fromkeys(METRIC_NAMES, 0.0), 'ee_speed_mean': 0.03,
+            'ee_sparc': -8.0
+        },
+        metrics_complete=True,
+        control_dt_s=1 / 15,
+        simulation_duration_s=8 / 15,
+        metrics_compute_s=0.02,
+        native_hdf5_path='/simulator/run_0.hdf5')
+    run.send('episode_end', end)
+    run.completed += 1
+    summary, directory, _ = run.finish()
+    assert summary['metrics_report_complete']
+    assert summary['overall']['score_mean_pct'] == 50
+    assert summary['overall']['ee_speed_cm_s'] == 3
+    assert summary['overall']['ee_speed_sd_cm_s'] == 0
+    assert summary['overall']['ee_sparc'] == -8
+    with (directory / 'episodes.csv').open() as file:
+        row = next(csv.DictReader(file))
+    assert row['score'] == '0.5'
+    assert row['success'] == 'False'
+    assert row['native_hdf5_path'] == '/simulator/run_0.hdf5'
+    assert summary['statistical_protocol']['bootstrap_seed'] == 0
