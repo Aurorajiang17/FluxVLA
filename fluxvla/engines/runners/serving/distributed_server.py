@@ -566,14 +566,23 @@ def run_model_worker(config_path: str,
 
 def _sampling_context(header: Mapping[str, Any]) -> dict[str, Any]:
     mode = header.get('sampling_mode', 'legacy_episode')
-    if mode not in {'legacy_episode', 'episode_noise_stream_v1'}:
+    if mode not in {
+            'legacy_episode', 'episode_noise_stream_v1',
+            'process_noise_stream_v1'
+    }:
         raise ValueError('Unsupported sampling_mode')
     context = {'sampling_mode': mode}
-    if mode == 'episode_noise_stream_v1':
+    if mode == 'process_noise_stream_v1' and 'task_id' in header:
+        context['task_id'] = _required_string(header, 'task_id')
+    if mode in {'episode_noise_stream_v1', 'process_noise_stream_v1'}:
         sequence = _required_int(header, 'sequence')
         if sequence < 1:
             raise ValueError('sequence must be positive')
         state = header.get('rng_state')
+        if mode == 'process_noise_stream_v1' and (
+                state is not None or header.get('rng_format') is not None):
+            raise ValueError(
+                'Process sampling does not accept caller RNG state')
         if state is not None and (not isinstance(state, bytes)
                                   or not 0 < len(state) <= 65536):
             raise ValueError('rng_state must be bounded bytes')
@@ -609,7 +618,17 @@ def _predict_request(runner, header, payload):
             sequence=sampling['sequence'])
         result.update(rng_state=state, rng_format=fmt)
     else:
+        if mode == 'process_noise_stream_v1' and getattr(
+                runner, 'process_checkpoint_dir', None):
+            runner.checkpoint_process_task(header.get('task_id'))
         actions, elapsed = runner.predict_action(*args)
+        if mode == 'process_noise_stream_v1':
+            response.update(
+                sampling_mode=mode,
+                episode_id=sampling['episode_id'],
+                sequence=sampling['sequence'],
+                process_instance_id=runner.process_instance_id,
+                process_sequence=runner.process_request_sequence)
     result['actions'] = np.asarray(actions, dtype=np.float32)
     return result, elapsed, response
 
@@ -693,6 +712,15 @@ def launch_server_task(*,
         raise TypeError('rank must be an integer')
     if rank < 0 or rank >= world_size:
         raise ValueError('rank must be in [0, world_size)')
+    if world_size > 1:
+        from mmengine import Config
+        cfg = Config.fromfile(config_path, import_custom_modules=False)
+        if cfg_options:
+            cfg.merge_from_dict(dict(cfg_options))
+        mode = cfg.themis.server.get('runner', {}).get('sampling_mode')
+        if mode == 'process_noise_stream_v1':
+            raise ValueError(
+                'Process sampling requires one model worker per endpoint')
     node_id = f'{network_socket.gethostname()}-rank-{rank}'
     if deployment_id is None:
         deployment_id = (

@@ -1,5 +1,13 @@
 # FluxVLA Serving
 
+Process-mode runners optionally accept `process_checkpoint_dir` to save the
+actual Python, NumPy, CPU Torch and device Torch states before a task's first
+request. `process_resume=dict(path=..., sha256=...)` explicitly restores a
+verified state and its request count after model initialization. The seed,
+Torch version and device type must match. Each restored service has a new
+physical process identity, so evaluation reports must retain the old lineage.
+These options do not assume any particular model dimensions or noise sampler.
+
 FluxVLA Serving provides a lightweight, high-performance remote inference
 framework that decouples VLA model execution from robot control. A GPU server
 hosts the model behind a ZMQ (ZeroMQ) REP socket, while the robot-side client
@@ -263,3 +271,38 @@ Client (robot)                    Server (GPU)
      |  decode action                  |
      |  execute on robot               |
 ```
+
+## RoboLab process sampling
+
+The matching FluxThemis entry `scripts/run_robolab_process.py` launches this
+repository's public `scripts/distributed_zmq_server.py` with
+`configs/pi05/pi05_paligemma_robolab_droid_jointpos_process_inference.py`.
+One persistent model serves each complete logical task stream. Themis can
+schedule independent streams across one or more physical GPUs.
+
+The process recipe inherits checkpoint loading, parameter dtypes, BF16
+autocast, preprocessing and action conversion from the DROID episode recipe.
+Its explicit `torch_runtime` disables TF32, selects highest float32 matmul
+precision, and uses two model threads and one interop thread. These settings
+apply before model loading and remain optional for other serving recipes.
+
+`process_seed=0` seeds Python, NumPy and Torch once after model initialization.
+Subsequent requests consume the default continuous device stream across lanes,
+episodes and tasks. Request episode seeds do not reseed it. This follows
+OpenPI's PyTorch stream lifecycle; OpenPI does not mandate the integer 0.
+Responses carry a process instance ID and increasing request ordinal.
+
+Use one model worker per endpoint, independent endpoints for additional
+streams, fixed task/request order and no warmup. Keep each service alive until
+its complete task list ends. Model failures seal the stream; recovery needs
+the exact state and prefix, not reseeding and skipping completed tasks.
+
+The original `pi05_paligemma_robolab_droid_jointpos_inference.py` remains the
+explicit episode recipe with existing multiworker behavior. Both sides must
+select the same protocol. Install matching Themis client/launcher changes
+before selecting process mode.
+
+Assets remain explicit through `FLUXVLA_ROBOLAB_CHECKPOINT`,
+`FLUXVLA_ROBOLAB_STATS` and `FLUXVLA_ROBOLAB_TOKENIZER`. Prepared matching assets
+are required. No private diagnostic adapter, `sitecustomize.py` or experimental
+model service wrapper is needed by the public entry.

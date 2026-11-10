@@ -6,6 +6,7 @@ import json
 import os
 import random
 import time
+import uuid
 from collections.abc import Mapping
 from contextlib import nullcontext
 from numbers import Integral
@@ -36,7 +37,10 @@ class FluxVLAServingRunner:
                  denormalize_context: Mapping[str, Any] | None = None,
                  denormalize_per_action: bool = False,
                  expected_unnorm_key: str = '',
-                 sampling_mode: str = 'legacy_episode') -> None:
+                 sampling_mode: str = 'legacy_episode',
+                 process_seed: int | None = None,
+                 process_resume: Mapping[str, Any] | None = None,
+                 process_checkpoint_dir: str | None = None) -> None:
         if not callable(dataset):
             raise TypeError('FluxVLA server dataset must be callable')
         if (not model_outputs_environment_actions
@@ -64,11 +68,24 @@ class FluxVLAServingRunner:
             raise TypeError('denormalize_context must be a mapping')
         if not isinstance(expected_unnorm_key, str):
             raise TypeError('expected_unnorm_key must be a string')
-        if sampling_mode not in {'legacy_episode', 'episode_noise_stream_v1'}:
+        if sampling_mode not in {
+                'legacy_episode', 'episode_noise_stream_v1',
+                'process_noise_stream_v1'
+        }:
             raise ValueError('Unsupported sampling_mode')
         if (sampling_mode == 'episode_noise_stream_v1' and getattr(
                 vla, 'supports_noise_generator', False) is not True):
             raise ValueError('Model must explicitly support noise_generator')
+
+        if sampling_mode == 'process_noise_stream_v1':
+            if isinstance(process_seed,
+                          bool) or not isinstance(process_seed, Integral):
+                raise ValueError('Process sampling requires an explicit '
+                                 'integer process_seed')
+            if not 0 <= process_seed < 2**32:
+                raise ValueError('process_seed must be in [0, 2**32)')
+        elif process_seed is not None:
+            raise ValueError('process_seed is only valid for process sampling')
 
         self.vla = vla
         self.dataset = dataset
@@ -90,12 +107,38 @@ class FluxVLAServingRunner:
             self.vla.to(device=self.device, dtype=self.mixed_precision_dtype)
         else:
             self.vla.to(self.device)
+        self.process_instance_id = None
+        self.process_request_sequence = 0
+        self._process_stream_failed = False
+        if self.sampling_mode == 'process_noise_stream_v1':
+            # Seed once after loading; client resets never reseed the model.
+            self._seed_policy_rngs(process_seed)
+            self.process_instance_id = uuid.uuid4().hex
+        self.process_seed = process_seed
+        self.process_checkpoint_dir = process_checkpoint_dir
+        self._checkpoint_task = None
+        if sampling_mode != 'process_noise_stream_v1' and (
+                process_resume or process_checkpoint_dir):
+            raise ValueError('Process state controls require process sampling')
+        if process_resume:
+            self._restore_process_state(process_resume)
 
     def predict_action(self, observation: Mapping[str, Any], unnorm_key: str,
                        policy_seed: int) -> tuple[np.ndarray, float]:
         """Process one self-contained request and return ``[T, A]`` actions."""
-        actions, elapsed, _ = self._predict_action(observation, unnorm_key,
-                                                   policy_seed)
+        process_stream = self.sampling_mode == 'process_noise_stream_v1'
+        if process_stream and self._process_stream_failed:
+            raise RuntimeError(
+                'Process RNG stream failed; explicit recovery is required')
+        try:
+            actions, elapsed, _ = self._predict_action(observation, unnorm_key,
+                                                       policy_seed)
+        except BaseException:
+            if process_stream:
+                self._process_stream_failed = True
+            raise
+        if process_stream:
+            self.process_request_sequence += 1
         return actions, elapsed
 
     def predict_action_with_sampling_state(
@@ -158,7 +201,10 @@ class FluxVLAServingRunner:
                 f'Request unnorm_key {unnorm_key!r} does not match the '
                 f'configured key {self.expected_unnorm_key!r}')
         unnorm_key = unnorm_key or self.expected_unnorm_key
-        self._seed_policy_rngs(policy_seed)
+        if self.sampling_mode != 'process_noise_stream_v1':
+            self._seed_policy_rngs(policy_seed)
+        elif noise_generator is not None or initialize_noise_stream:
+            raise ValueError('Process sampling uses the device default RNG')
         result = self.dataset(dict(observation))
         batch = result[0] if isinstance(result, tuple) else result
         if not isinstance(batch, Mapping):
@@ -169,7 +215,8 @@ class FluxVLAServingRunner:
         batch['reset_history'] = True
         if unnorm_key:
             batch['unnorm_key'] = unnorm_key
-        batch['seed'] = int(policy_seed)
+        if self.sampling_mode != 'process_noise_stream_v1':
+            batch['seed'] = int(policy_seed)
         batch = self._move_to_device(batch)
         if noise_generator is not None:
             if initialize_noise_stream:
@@ -201,6 +248,87 @@ class FluxVLAServingRunner:
             unnorm_key=unnorm_key,
             request_context=request_context)
         return actions, inference_time_s, noise_generator
+
+    def process_state(self):
+        """Serialize default generators without advancing randomness."""
+        import base64
+
+        def encode(tensor):
+            return base64.b64encode(
+                tensor.cpu().numpy().tobytes()).decode('ascii')
+
+        numpy_state = np.random.get_state()
+        return dict(
+            version=1,
+            seed=self.process_seed,
+            sequence=self.process_request_sequence,
+            torch_version=torch.__version__,
+            device_type=self.device.type,
+            python=random.getstate(),
+            numpy=[numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]],
+            cpu=encode(torch.get_rng_state()),
+            device=encode(torch.cuda.get_rng_state(self.device))
+            if self.device.type == 'cuda' else None)
+
+    def _restore_process_state(self, config):
+        import base64
+        import hashlib
+        path = Path(config['path'])
+        if path.stat().st_size > 1024 * 1024:
+            raise ValueError('Process state file hash/size mismatch')
+        raw = path.read_bytes()
+        if len(raw) > 1024 * 1024 or hashlib.sha256(
+                raw).hexdigest() != config['sha256']:
+            raise ValueError('Process state file hash/size mismatch')
+        state = json.loads(raw)
+        if (state['version'] != 1 or state['seed'] != self.process_seed
+                or state['torch_version'] != torch.__version__
+                or state['device_type'] != self.device.type
+                or type(state['sequence']) is not int
+                or state['sequence'] < 0):
+            raise ValueError('Process state configuration mismatch')
+
+        def tensor(value):
+            data = base64.b64decode(value, validate=True)
+            return torch.from_numpy(np.frombuffer(data, dtype=np.uint8).copy())
+
+        def tuples(value):
+            return tuple(map(tuples, value)) if isinstance(value,
+                                                           list) else value
+
+        random.setstate(tuples(state['python']))
+        numpy_state = state['numpy']
+        np.random.set_state(
+            (numpy_state[0], np.asarray(numpy_state[1],
+                                        dtype=np.uint32), *numpy_state[2:]))
+        torch.set_rng_state(tensor(state['cpu']))
+        if self.device.type == 'cuda':
+            torch.cuda.set_rng_state(tensor(state['device']), self.device)
+        self.process_request_sequence = state['sequence']
+        if self.process_state() != state:
+            # JSON changes tuples into lists; compare canonical encodings.
+            if json.dumps(
+                    self.process_state(), sort_keys=True) != json.dumps(
+                        state, sort_keys=True):
+                raise ValueError('Restored process state differs')
+
+    def checkpoint_process_task(self, task_id):
+        if not self.process_checkpoint_dir or task_id == self._checkpoint_task:
+            return
+        import hashlib
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError('Task-boundary checkpoints require task_id')
+        directory = Path(self.process_checkpoint_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (
+            hashlib.sha256(task_id.encode()).hexdigest() + '.json')
+        if path.exists():
+            raise ValueError(
+                'Task checkpoint already exists; no implicit overwrite')
+        state = self.process_state()
+        with path.open('x') as stream:
+            stream.write(json.dumps(state, allow_nan=False) + '\n')
+        self._checkpoint_task = task_id
 
     @staticmethod
     def _seed_policy_rngs(policy_seed: int) -> None:
@@ -343,6 +471,7 @@ def build_serving_runner_from_config(
         require_mapping(
             themis_cfg.get('transport', _MISSING), 'themis.transport'))
     server_cfg = get_server_config(themis_cfg)
+    configure_torch_runtime(server_cfg.get('torch_runtime'))
 
     section_name = server_cfg.get('dataset_section', 'eval')
     if section_name not in {'eval', 'inference'}:
@@ -437,6 +566,46 @@ def build_serving_runner_from_config(
                                                   False),
             expected_unnorm_key=str(transport.get('unnorm_key', '')),
         ))
+
+
+def configure_torch_runtime(settings: Mapping[str, Any] | None) -> None:
+    """Apply explicit process-wide controls before constructing the model.
+
+    Omitted settings preserve the caller's runtime and existing recipes.
+    """
+    if settings is None:
+        return
+    allowed = {
+        'num_threads', 'num_interop_threads', 'float32_matmul_precision',
+        'allow_tf32_matmul', 'allow_tf32_cudnn'
+    }
+    if not isinstance(settings, Mapping) or set(settings) - allowed:
+        raise ValueError('Unknown torch_runtime settings')
+    for key in ('num_threads', 'num_interop_threads'):
+        if key in settings:
+            value = settings[key]
+            if type(value) is not int or value < 1:
+                raise ValueError(
+                    f'torch_runtime.{key} must be positive integer')
+    precision = settings.get('float32_matmul_precision')
+    if precision is not None and precision not in {
+            'highest', 'high', 'medium'
+    }:
+        raise ValueError('Invalid float32_matmul_precision')
+    for key in ('allow_tf32_matmul', 'allow_tf32_cudnn'):
+        if key in settings and type(settings[key]) is not bool:
+            raise ValueError(f'torch_runtime.{key} must be boolean')
+    if 'num_threads' in settings:
+        torch.set_num_threads(settings['num_threads'])
+    if ('num_interop_threads' in settings and torch.get_num_interop_threads()
+            != settings['num_interop_threads']):
+        torch.set_num_interop_threads(settings['num_interop_threads'])
+    if precision is not None:
+        torch.set_float32_matmul_precision(precision)
+    if 'allow_tf32_matmul' in settings:
+        torch.backends.cuda.matmul.allow_tf32 = settings['allow_tf32_matmul']
+    if 'allow_tf32_cudnn' in settings:
+        torch.backends.cudnn.allow_tf32 = settings['allow_tf32_cudnn']
 
 
 def get_server_config(themis_cfg: Mapping[str, Any]) -> dict[str, Any]:
