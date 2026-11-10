@@ -225,6 +225,13 @@ class DistributedRepeatingDataset(IterableDataset):
         self._epoch = 0
         self._runner_epoch = torch.full((), -1,
                                         dtype=torch.int64).share_memory_()
+        # Resume position shared with persistent workers; epoch -1 means none.
+        self._resume_epoch = torch.full((), -1,
+                                        dtype=torch.int64).share_memory_()
+        self._resume_rank_batches = torch.zeros(
+            (), dtype=torch.int64).share_memory_()
+        self._resume_batch_size = torch.zeros(
+            (), dtype=torch.int64).share_memory_()
 
     def set_epoch(self, epoch: int) -> None:
         """Set the runner epoch shared by persistent DataLoader workers.
@@ -235,6 +242,46 @@ class DistributedRepeatingDataset(IterableDataset):
         if epoch < 0:
             raise ValueError(f'`epoch` must be non-negative, got {epoch}.')
         self._runner_epoch.fill_(epoch)
+
+    def set_resume_position(self, epoch: int, rank_batches: int,
+                            batch_size: int) -> None:
+        """Continue the batch stream this rank had trained on in ``epoch``.
+
+        A DataLoader serves an iterable dataset's batches from its workers in
+        round-robin order, so worker ``w`` of ``W`` produced exactly the rank
+        batches ``j < rank_batches`` with ``j % W == w``. On the first pass of
+        ``epoch`` each worker continues the shard of the worker that owned
+        the next batch in that order and skips its delivered prefix; later
+        epochs start from their beginning. Call before workers iterate.
+
+        Args:
+            epoch: Runner epoch being resumed.
+            rank_batches: Micro-batches this rank consumed in ``epoch``.
+            batch_size: Per-rank DataLoader batch size.
+        """
+        if epoch < 0 or rank_batches < 0 or batch_size <= 0:
+            raise ValueError('Resume position needs epoch >= 0, '
+                             'rank_batches >= 0 and batch_size > 0.')
+        self._resume_epoch.fill_(int(epoch))
+        self._resume_rank_batches.fill_(int(rank_batches))
+        self._resume_batch_size.fill_(int(batch_size))
+
+    def _resume_assignment(self, epoch: int, worker_id: int,
+                           num_workers: int) -> tuple[int, int]:
+        """Return the shard owner and items already delivered for a worker.
+
+        A new DataLoader asks worker 0 first, but the next uninterrupted
+        batch ``k`` came from worker ``k % W``. During the resumed epoch,
+        worker ``p`` therefore continues the shard of worker ``(p + k) % W``.
+        """
+        resume_epoch = getattr(self, '_resume_epoch', None)
+        if resume_epoch is None or int(resume_epoch.item()) != epoch:
+            return worker_id, 0
+        rank_batches = int(self._resume_rank_batches.item())
+        owner = (worker_id + rank_batches) % num_workers
+        owner_batches = max(0, (rank_batches - owner + num_workers - 1) //
+                            num_workers)
+        return owner, owner_batches * int(self._resume_batch_size.item())
 
     def configure_sharding(
         self,
@@ -667,6 +714,26 @@ class DistributedRepeatingDataset(IterableDataset):
         worker_batches = rank_batches[worker_id::num_workers]
         return worker_batches.reshape(-1).tolist()
 
+    def _set_inner_sample_epoch(self, epoch: int) -> None:
+        """Forward the iteration epoch to datasets that opt in.
+
+        Only datasets defining ``set_sample_epoch`` (for example frozen-start
+        :class:`ParquetDatasetV3`) receive it; others are unaffected.
+        """
+        if self.is_grouped:
+            datasets = [
+                dataset for group in self.grouped_datasets.values()
+                for dataset in group
+            ]
+        elif self.is_list:
+            datasets = self.datasets
+        else:
+            datasets = [self.dataset]
+        for dataset in datasets:
+            set_sample_epoch = getattr(dataset, 'set_sample_epoch', None)
+            if callable(set_sample_epoch):
+                set_sample_epoch(epoch)
+
     def __iter__(self) -> Iterator:
         # Incorporate DataLoader worker info so data is split across both
         # distributed processes and per-process DataLoader workers.
@@ -682,6 +749,8 @@ class DistributedRepeatingDataset(IterableDataset):
         runner_epoch = (-1
                         if shared_epoch is None else int(shared_epoch.item()))
 
+        first_pass = True
+        shard_worker = worker_id
         while True:
             if runner_epoch >= 0:
                 epoch = runner_epoch
@@ -689,19 +758,28 @@ class DistributedRepeatingDataset(IterableDataset):
                 epoch = self._epoch
             if runner_epoch < 0 and self.reshuffle_each_epoch:
                 self._epoch += 1
+            self._set_inner_sample_epoch(epoch)
+            offset = 0
+            if first_pass:
+                first_pass = False
+                shard_worker, offset = self._resume_assignment(
+                    epoch, worker_id, num_workers)
 
             if self._sharding_strategy == 'round_robin':
                 indices = self._get_round_robin_indices(epoch)
-                shard = self._get_round_robin_shard(indices, worker_id,
+                shard = self._get_round_robin_shard(indices, shard_worker,
                                                     num_workers)
             elif self._sharding_strategy == 'blockwise':
                 indices = self._get_blockwise_indices(epoch)
-                shard = self._get_blockwise_shard(indices, worker_id,
+                shard = self._get_blockwise_shard(indices, shard_worker,
                                                   num_workers)
             else:
                 raise RuntimeError('Unsupported dataset sharding strategy: '
                                    f'{self._sharding_strategy!r}.')
 
+            # Within one runner epoch every pass repeats the same shard.
+            if offset and shard:
+                shard = shard[offset % len(shard):]
             for idx in shard:
                 yield self._get_item_from_global_idx(idx)
 

@@ -112,6 +112,10 @@ class ProcessParquetInputs():
             selecting ``'torchcodec'`` is strict and raises instead of falling
             back. The TorchCodec path decodes by frame index
             (``round(ts * average_fps)``).
+
+    Samples that carry ``lerobot_episode_meta`` (LeRobot v3 location columns)
+    resolve chunk/file videos and add the episode's ``from_timestamp``;
+    ``lerobot_video_keys`` overrides ``video_keys`` for that sample.
     """
 
     def __init__(self,
@@ -167,21 +171,41 @@ class ProcessParquetInputs():
         images = list()
         img_masks = list()
         timestamps = data.get('frame_timestamps', [data['timestamp']])
-        for video_key in self.video_keys:
-            episode_chunk = data['episode_index'] // data['info'][
-                'chunks_size']  # noqa: E501
-            video_path = os.path.join(
-                data['data_root'],
-                video_root_path.format(
-                    episode_chunk=episode_chunk,
-                    video_key=video_key,
-                    episode_index=data['episode_index']))
+        # LeRobot v3 episodes share chunk/file videos; datasets that attach
+        # their episode location also choose the decoded keys per sample.
+        episode_meta = data.get('lerobot_episode_meta')
+        video_keys = data.get('lerobot_video_keys', self.video_keys)
+        for video_key in video_keys:
+            decode_offset = 0.0
+            if episode_meta is not None:
+                video_path = build_lerobot_video_path(data['data_root'],
+                                                      data['info'],
+                                                      episode_meta,
+                                                      data['episode_index'],
+                                                      video_key)
+                offset_key = f'videos/{video_key}/from_timestamp'
+                if offset_key not in episode_meta:
+                    raise KeyError(f'Missing episode video offset: '
+                                   f'{offset_key}')
+                decode_offset = float(episode_meta[offset_key])
+            else:
+                episode_chunk = data['episode_index'] // data['info'][
+                    'chunks_size']  # noqa: E501
+                video_path = os.path.join(
+                    data['data_root'],
+                    video_root_path.format(
+                        episode_chunk=episode_chunk,
+                        video_key=video_key,
+                        episode_index=data['episode_index']))
             assert os.path.exists(
                 video_path), f'Video file not found: {video_path}'
             # Load all requested timestamps at once (supports temporal window)
             unique_ts = sorted(set(timestamps))
+            query_ts = (
+                unique_ts if episode_meta is None else
+                [ts + decode_offset for ts in unique_ts])
             frames_tensor = decode_video_frames(
-                video_path, unique_ts, 0.1, backend=self.video_backend)
+                video_path, query_ts, 0.1, backend=self.video_backend)
             ts_to_frame = {
                 ts: frames_tensor[i]
                 for i, ts in enumerate(unique_ts)

@@ -17,6 +17,7 @@ import gc
 import inspect
 import math
 import os
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +77,28 @@ class BaseTrainRunner(ABC):
             Defaults to 'round_robin'.
         sharding_strategy (str, optional): Sharding strategy for
             distributed training. Defaults to 'full-shard'.
+        strict_training_state (bool, optional): Make resume and updates fail
+            instead of silently continuing: the checkpoint must hold the
+            model, step/epoch, optimizer and scheduler state (and the raw
+            training weights when EMA is enabled), and every load must
+            succeed; the optimizer is never rebuilt after a size/shape error.
+            Restored training does not replay the data iterator position.
+            Defaults to False.
+        expected_global_batch_size (int, optional): Required value of
+            per-device batch x world size x gradient accumulation; a mismatch
+            raises at construction. Set to None to accept any value.
+            Defaults to None.
+        resume_data_progress (bool, optional): Save the epoch and the
+            optimizer steps completed in it, and on resume continue the data
+            stream after the samples already trained on, instead of
+            restarting the epoch. Step-based training only; the dataset must
+            implement ``set_resume_position`` and world size, batch,
+            accumulation, workers, sharding, dataset length and shuffle seed
+            must match the checkpoint. Defaults to False.
+        milestone_interval (int, optional): Keep the ``.safetensors``
+            weights of checkpoints whose step is a multiple of this value when
+            older checkpoints are removed; their ``.pt`` training state still
+            follows ``max_keep_ckpts``. Defaults to None.
     """
 
     def __init__(self,
@@ -103,7 +126,11 @@ class BaseTrainRunner(ABC):
                  seed: Optional[int] = None,
                  evaluator: Optional[Dict] = None,
                  tokenizer: Optional[Dict] = None,
-                 resume_from: Optional[str] = None):
+                 resume_from: Optional[str] = None,
+                 strict_training_state: bool = False,
+                 expected_global_batch_size: Optional[int] = None,
+                 resume_data_progress: bool = False,
+                 milestone_interval: Optional[int] = None):
         from ..utils.builder import (build_collator_from_cfg,
                                      build_metric_from_cfg, build_vla_from_cfg)
 
@@ -191,6 +218,18 @@ class BaseTrainRunner(ABC):
         self.optimizer, self.lr_scheduler = None, None
         self.wandb_mode = os.environ.get('WANDB_MODE', 'online')
         self.resume_from = resume_from
+        self.strict_training_state = bool(strict_training_state)
+        self._check_global_batch_size(expected_global_batch_size)
+        self.expected_global_batch_size = expected_global_batch_size
+        self.resume_data_progress = bool(resume_data_progress)
+        if milestone_interval is not None and int(milestone_interval) <= 0:
+            raise ValueError('milestone_interval must be positive or None.')
+        self.milestone_interval = (None if milestone_interval is None else
+                                   int(milestone_interval))
+        self._epoch_step_count = 0
+        self._resume_epoch_step = 0
+        self._pending_data_progress = None
+        self._train_dataset = None
         # Track if optimizer state was successfully loaded
         self.optimizer_state_loaded = False
         self.num_training_steps = None
@@ -206,6 +245,19 @@ class BaseTrainRunner(ABC):
                 'Only BF16 mixed precision training is supported!'
             assert check_bf16_supported(), \
                 'BFloat16 is not supported on this hardware; unset `mixed_precision`'  # noqa: E501
+
+    def _check_global_batch_size(self, expected: Optional[int]) -> None:
+        """Reject a global batch that differs from the configured recipe."""
+        if expected is None or self.global_batch_size == int(expected):
+            return
+        raise ValueError(
+            f'Global batch {self.global_batch_size} = per-device batch '
+            f'{self.per_device_batch_size} x world size '
+            f'{overwatch.world_size()} x gradient accumulation '
+            f'{self.grad_accumulation_steps} differs from the required '
+            f'{expected}. Change per_device_batch_size or '
+            'grad_accumulation_steps, or explicitly set '
+            'runner.expected_global_batch_size=None.')
 
     def _unwrap_vla(self) -> torch.nn.Module:
         """Return the model underneath a distributed wrapper."""
@@ -460,6 +512,9 @@ class BaseTrainRunner(ABC):
                 f'Resuming training from checkpoint: {self.resume_from}')
         checkpoint_info = torch.load(
             self.resume_from, map_location='cpu', weights_only=True)
+        strict = getattr(self, 'strict_training_state', False)
+        if strict:
+            self._check_strict_checkpoint(checkpoint_info)
 
         # Restore model state (delegated to subclasses for FSDP/DDP-specific
         # handling)
@@ -492,12 +547,16 @@ class BaseTrainRunner(ABC):
                 success = self._load_optimizer_state(
                     checkpoint_optimizer_state)
                 if not success:
+                    if strict:
+                        raise RuntimeError('Optimizer state was not restored.')
                     if overwatch.is_rank_zero():
                         overwatch.warning(
                             'Failed to load optimizer state. '
                             'Training will continue with fresh optimizer '
                             'state.')
             except Exception as e:
+                if strict:
+                    raise
                 if overwatch.is_rank_zero():
                     overwatch.warning(
                         f'Error loading optimizer state: {e}. '
@@ -518,13 +577,116 @@ class BaseTrainRunner(ABC):
                 if overwatch.is_rank_zero():
                     overwatch.info('Scheduler state restored from checkpoint')
             except Exception as e:
+                if strict:
+                    raise
                 overwatch.warning(f'Failed to load scheduler state: {e}')
+
+        if getattr(self, 'resume_data_progress', False):
+            # Applied in run() once the dataset and epoch length are known.
+            self._pending_data_progress = checkpoint_info.get('data_progress')
+            if (self._pending_data_progress is None
+                    and overwatch.is_rank_zero()):
+                overwatch.warning(
+                    'Checkpoint has no data progress; the data stream '
+                    'restarts at the beginning of the current epoch.')
 
         if overwatch.is_rank_zero():
             overwatch.info(
                 f'Resumed training from step {self.metric.global_step}, '
                 f'epoch {self.current_epoch}')
         dist.barrier()
+
+    def _check_strict_checkpoint(self, checkpoint_info: Dict) -> None:
+        """Reject checkpoints that cannot restore the full training state."""
+        required = ['model', 'global_step', 'epoch']
+        if self.optimizer is not None:
+            required.append('optimizer_state_dict')
+        if self.lr_scheduler is not None:
+            required.append('scheduler_state_dict')
+        ema_decay = getattr(self, 'ema_decay', None)
+        if ema_decay is not None:
+            required.append('train_model')
+        if getattr(self, 'resume_data_progress', False):
+            required.append('data_progress')
+        missing = [key for key in required if key not in checkpoint_info]
+        if missing:
+            raise KeyError(f'Checkpoint lacks training state: {missing}')
+        if ema_decay is None and 'train_model' in checkpoint_info:
+            raise ValueError('Checkpoint holds EMA weights but EMA is off.')
+        saved_decay = checkpoint_info.get('ema_decay')
+        if ema_decay is not None and saved_decay != ema_decay:
+            raise ValueError(f'Checkpoint EMA decay {saved_decay} differs '
+                             f'from configured {ema_decay}.')
+
+    def _data_progress_signature(self, dataset) -> Dict[str, Any]:
+        """Settings that must match for a saved data position to be valid."""
+        return {
+            'world_size': overwatch.world_size(),
+            'per_device_batch_size': self.per_device_batch_size,
+            'grad_accumulation_steps': self.grad_accumulation_steps,
+            'num_workers': self.per_device_num_workers,
+            'sharding_strategy': self.dataset_sharding_strategy,
+            'dataset_length': len(dataset),
+            'steps_per_epoch': self.steps_per_epoch,
+            'dataset_seed': getattr(dataset, 'seed', None),
+            'shuffle': getattr(dataset, 'shuffle', None),
+            'reshuffle_each_epoch': getattr(dataset, 'reshuffle_each_epoch',
+                                            None),
+        }
+
+    def _data_progress_state(self) -> Dict[str, Any]:
+        """Data position after the optimizer steps completed so far."""
+        state = {
+            'version': 1,
+            'epoch': int(self.current_epoch),
+            'epoch_step': int(self._epoch_step_count),
+        }
+        state.update(self._data_progress_signature(self._train_dataset))
+        return state
+
+    def _apply_data_progress(self, dataset) -> None:
+        """Position the data stream after the samples already trained on."""
+        progress = getattr(self, '_pending_data_progress', None)
+        self._pending_data_progress = None
+        if not getattr(self, 'resume_data_progress', False) or not progress:
+            return
+        if progress.get('version') != 1:
+            raise ValueError(f'Unsupported data progress: {progress!r}')
+        current = self._data_progress_signature(dataset)
+        mismatched = {
+            key: (progress.get(key), value)
+            for key, value in current.items() if progress.get(key) != value
+        }
+        if mismatched:
+            raise ValueError('Cannot resume the data position because these '
+                             f'settings changed (saved, current): '
+                             f'{mismatched}')
+        steps_per_epoch = self.steps_per_epoch
+        epoch, epoch_step = divmod(
+            int(progress['epoch']) * steps_per_epoch +
+            int(progress['epoch_step']), steps_per_epoch)
+        if epoch * steps_per_epoch + epoch_step != self.metric.global_step:
+            raise ValueError(
+                f'Data progress epoch {progress["epoch"]} step '
+                f'{progress["epoch_step"]} does not match global_step '
+                f'{self.metric.global_step} with {steps_per_epoch} steps per '
+                'epoch.')
+        set_resume_position = getattr(dataset, 'set_resume_position', None)
+        if not callable(set_resume_position):
+            raise TypeError(f'{type(dataset).__name__} cannot resume a data '
+                            'position.')
+        set_resume_position(epoch, epoch_step * self.grad_accumulation_steps,
+                            self.per_device_batch_size)
+        self.current_epoch = epoch
+        self._resume_epoch_step = epoch_step
+        if overwatch.is_rank_zero():
+            overwatch.info(f'Resuming data at epoch {epoch}, step '
+                           f'{epoch_step}/{steps_per_epoch}.')
+
+    def _is_milestone_checkpoint(self, file_name: str) -> bool:
+        interval = getattr(self, 'milestone_interval', None)
+        match = re.match(r'step-(\d+)-', file_name)
+        return bool(interval and match and int(match.group(1)) % interval == 0)
 
     def _initialize_ema_parameters(self) -> None:
         """Create FP32/local-shard EMA buffers from current parameters."""
@@ -653,7 +815,9 @@ class BaseTrainRunner(ABC):
                     overwatch.info(f'Removed old checkpoint: {old_ckpt}')
                     sf_file = old_ckpt.replace('.pt', '.safetensors')
                     sf_path = os.path.join(checkpoint_dir, sf_file)
-                    if os.path.exists(sf_path):
+                    if self._is_milestone_checkpoint(old_ckpt):
+                        overwatch.info(f'Kept milestone weights: {sf_file}')
+                    elif os.path.exists(sf_path):
                         os.remove(sf_path)
                         overwatch.info(f'Removed old safetensors: {sf_file}')
                 except Exception as e:
@@ -690,6 +854,10 @@ class BaseTrainRunner(ABC):
 
     def run(self, vla_dataset, eval_dataset=None) -> None:
         """Train the VLA model."""
+        if (getattr(self, 'resume_data_progress', False)
+                and self.training_mode != 'step_based'):
+            raise ValueError('resume_data_progress requires max_steps.')
+        self._train_dataset = vla_dataset
         self._configure_dataset_sharding(vla_dataset)
         training_eval_dataset = (
             vla_dataset if eval_dataset is None else eval_dataset)
@@ -718,6 +886,7 @@ class BaseTrainRunner(ABC):
         self.steps_per_epoch = self._get_steps_per_epoch(vla_dataset)
         self._log_training_info(vla_dataset)
         self.resume()
+        self._apply_data_progress(vla_dataset)
         self._initialize_ema_parameters()
 
         # Dispatch to training mode specific loop
@@ -840,13 +1009,16 @@ class BaseTrainRunner(ABC):
                 initial=self.metric.global_step) as progress:
 
             dataloader_iter = None
-            epoch_step_count = 0
+            # Nonzero only when a saved data position was restored.
+            epoch_step_count = getattr(self, '_resume_epoch_step', 0)
+            self._resume_epoch_step = 0
 
             while self.metric.global_step < self.max_steps:
                 loss, dataloader_iter = self._run_accumulated_training_step(
                     dataloader, dataloader_iter, sampler)
                 self._loss_accumulator.append(loss)
                 epoch_step_count += 1
+                self._epoch_step_count = epoch_step_count
 
                 # Update metrics
                 self.metric.commit(
@@ -868,6 +1040,7 @@ class BaseTrainRunner(ABC):
                         and epoch_step_count >= self.steps_per_epoch):
                     self.current_epoch += 1
                     epoch_step_count = 0
+                    self._epoch_step_count = 0
                     dataloader_iter = None
 
         return self._get_checkpoint_path()
@@ -1065,7 +1238,9 @@ class BaseTrainRunner(ABC):
         try:
             self.optimizer.step()
         except RuntimeError as e:
-            if 'size' in str(e).lower() or 'shape' in str(e).lower():
+            message = str(e).lower()
+            mismatch = 'size' in message or 'shape' in message
+            if mismatch and not getattr(self, 'strict_training_state', False):
                 self._reinit_optimizer()
                 self.optimizer.step()
             else:

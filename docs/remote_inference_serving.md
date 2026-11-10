@@ -306,3 +306,21 @@ Assets remain explicit through `FLUXVLA_ROBOLAB_CHECKPOINT`,
 `FLUXVLA_ROBOLAB_STATS` and `FLUXVLA_ROBOLAB_TOKENIZER`. Prepared matching assets
 are required. No private diagnostic adapter, `sitecustomize.py` or experimental
 model service wrapper is needed by the public entry.
+
+## RoboLab models trained with the DROID LeRobot recipe
+
+Checkpoints from `configs/pi05/pi05_paligemma_droid_lerobot_full_finetune.py`
+are served with `configs/pi05/pi05_paligemma_robolab_droid_lerobot_inference.py`.
+It inherits the process recipe above and differs only in two ways: the model
+returns 16-step chunks, its training horizon, and assets come from
+`FLUXVLA_ROBOLAB_DROID_FT_CHECKPOINT`, `FLUXVLA_ROBOLAB_DROID_FT_TOKENIZER` and
+`FLUXVLA_ROBOLAB_DROID_FT_STATS`. Without the statistics variable the server
+reads the training run's `dataset_statistics.json` next to `checkpoints/`.
+The released checkpoint keeps the 15-step jointpos recipes.
+
+The number of returned actions executed before the next observation is an
+evaluation setting (Themis `execute_horizon`), not part of this config.
+Evaluate these checkpoints executing 15 of the 16 actions, the replanning
+interval of the released pi05 baseline. Themis `configs/robolab/droid.py` uses
+`execute_horizon=None`, which executes all 16; point the process launch file's
+`simulator_config` at a config that inherits it with `execute_horizon=15`.

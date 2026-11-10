@@ -76,6 +76,15 @@ class FSDPTrainRunner(BaseTrainRunner):
             uses the model's existing policy, ``execution-block`` uses an
             execution-aware policy supplied by the model, and ``root`` wraps
             only the root module. Defaults to ``model``.
+        strict_training_state (bool): Fail on incomplete or unloadable
+            resume state, with exact model key matching; see
+            :class:`BaseTrainRunner`. Defaults to False.
+        expected_global_batch_size (int, optional): See
+            :class:`BaseTrainRunner`. Defaults to None.
+        resume_data_progress (bool): Save and restore the data position; see
+            :class:`BaseTrainRunner`. Defaults to False.
+        milestone_interval (int, optional): Keep milestone weights; see
+            :class:`BaseTrainRunner`. Defaults to None.
     """
 
     def __init__(self,
@@ -108,6 +117,10 @@ class FSDPTrainRunner(BaseTrainRunner):
                  change_key_name: bool = False,
                  tokenizer: Optional[Dict] = None,
                  resume_from: Optional[str] = None,
+                 strict_training_state: bool = False,
+                 expected_global_batch_size: Optional[int] = None,
+                 resume_data_progress: bool = False,
+                 milestone_interval: Optional[int] = None,
                  args=None,
                  *_unused_args,
                  **kwargs) -> None:
@@ -140,7 +153,11 @@ class FSDPTrainRunner(BaseTrainRunner):
             seed=seed,
             evaluator=evaluator,
             tokenizer=tokenizer,
-            resume_from=resume_from)
+            resume_from=resume_from,
+            strict_training_state=strict_training_state,
+            expected_global_batch_size=expected_global_batch_size,
+            resume_data_progress=resume_data_progress,
+            milestone_interval=milestone_interval)
         self.cfg = cfg
         self.args = args
         self.max_grad_norm = max_grad_norm
@@ -372,6 +389,9 @@ class FSDPTrainRunner(BaseTrainRunner):
                 if train_model_state_dicts is not None:
                     checkpoint_dict['train_model'] = train_model_state_dicts
                     checkpoint_dict['ema_decay'] = self.ema_decay
+                if getattr(self, 'resume_data_progress', False):
+                    checkpoint_dict['data_progress'] = (
+                        self._data_progress_state())
 
                 # Save scheduler state
                 if self.lr_scheduler is not None:
@@ -657,7 +677,9 @@ class FSDPTrainRunner(BaseTrainRunner):
                 checkpoint_model_state = full_state_dict
 
             # Load the state dict
-            self.vla.load_state_dict(checkpoint_model_state, strict=False)
+            self.vla.load_state_dict(
+                checkpoint_model_state,
+                strict=getattr(self, 'strict_training_state', False))
 
         # Synchronize after loading
         dist.barrier()
