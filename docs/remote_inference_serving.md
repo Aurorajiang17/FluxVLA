@@ -1,5 +1,15 @@
 # FluxVLA Serving
 
+For ordinary FluxThemis single-environment RoboLab evaluation, use the
+[RoboLab remote evaluation guide](robolab_remote_evaluation.md). It uses the
+distributed server; the real-robot protocol and explicit process recipes below
+retain their own entry points.
+The distributed server also offers opt-in continuous_sampling.routing='fixed_worker':
+N persistent model instances serve N fixed prediction clients through one broker.
+It requires single-node fixed assignment and complete evaluation reporting.
+The RoboLab guide owns GPU-list selection, configuration and launch commands;
+default dynamic serving and the existing single_client mode remain available.
+
 Process-mode runners optionally accept `process_checkpoint_dir` to save the
 actual Python, NumPy, CPU Torch and device Torch states before a task's first
 request. `process_resume=dict(path=..., sha256=...)` explicitly restores a

@@ -396,7 +396,7 @@ def test_robolab_recipe_builds_reporter_without_loading_model(tmp_path):
     root = Path(__file__).resolve().parents[2]
     config_path = root / (
         'configs/pi05/pi05_paligemma_robolab_droid_jointpos_inference.py')
-    cfg = Config.fromfile(str(config_path))
+    cfg = Config.fromfile(str(config_path), lazy_import=False)
     assert cfg.themis.server.dataset_section == 'eval'
     assert cfg.themis.server.evaluation_reporting.enabled
     checkpoint = tmp_path / 'checkpoints/model.safetensors'

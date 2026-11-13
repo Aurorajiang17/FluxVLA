@@ -60,7 +60,8 @@ def test_robocasa_runner_builds_without_checkpoint_or_stats(monkeypatch):
         base_eval_runner.overwatch, 'distributed_state', None, raising=False)
     cfg = Config.fromfile(
         Path(__file__).resolve().parents[2] /
-        'configs/openai/gpt6_astra_robocasa_inference.py')
+        'configs/openai/gpt6_astra_robocasa_inference.py',
+        lazy_import=False)
     runner_cfg = cfg.eval.copy()
     runner_cfg.cfg = cfg
     runner_cfg.ckpt_path = None

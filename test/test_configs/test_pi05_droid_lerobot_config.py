@@ -42,7 +42,7 @@ BASE_DROID_STATS_SHA256 = (
 
 @pytest.fixture(scope='module')
 def cfg():
-    return Config.fromfile(str(TRAIN))
+    return Config.fromfile(str(TRAIN), lazy_import=False)
 
 
 def test_recipe_matches_openpi_full_droid(cfg):
@@ -80,7 +80,7 @@ def _serving_config(monkeypatch, **environment):
         monkeypatch.delenv(name, raising=False)
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
-    return Config.fromfile(str(SERVE))
+    return Config.fromfile(str(SERVE), lazy_import=False)
 
 
 def test_trained_model_serving_uses_16_steps_and_own_assets(monkeypatch):
@@ -111,7 +111,7 @@ def test_trained_model_serving_uses_16_steps_and_own_assets(monkeypatch):
 def test_released_model_configs_keep_15_steps(monkeypatch):
     serve = _serving_config(monkeypatch)
     for path in RELEASED:
-        released = Config.fromfile(str(path))
+        released = Config.fromfile(str(path), lazy_import=False)
         assert released.model.n_action_steps == 15
         assert released.inference_model.n_action_steps == 15
         # The new entry changes only the horizon and asset paths.
@@ -238,7 +238,7 @@ def test_training_inputs_match_robolab_serving_inputs(cfg, tmp_path,
     for transform in train_transforms:
         sample = transform(sample)
 
-    serve_cfg = Config.fromfile(str(SERVE)).eval.dataset
+    serve_cfg = Config.fromfile(str(SERVE), lazy_import=False).eval.dataset
     serve_cfg.norm_stats = {'robolab_droid': stats}
     for spec in serve_cfg.transforms:
         if spec['type'] == 'ProcessPrompts':

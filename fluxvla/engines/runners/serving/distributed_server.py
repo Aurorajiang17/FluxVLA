@@ -20,6 +20,10 @@ from typing import Any
 
 import numpy as np
 
+from .continuous_sampling import (ContinuousSamplingSession,
+                                  continuous_sampling_config,
+                                  standard_request_context)
+from .fixed_worker_sampling import FixedWorkerContinuousSession
 from .serving_runner import (build_serving_runner_from_config, config_get,
                              get_server_config, require_mapping,
                              resolve_checkpoint_path,
@@ -38,6 +42,8 @@ class _PendingPrediction:
     payload: bytes
     deadline: float
     sampling_context: dict[str, Any] = field(default_factory=dict)
+    request_context: dict[str, Any] = field(default_factory=dict)
+    ticket: Any = None
 
 
 @dataclass
@@ -48,6 +54,8 @@ class _ModelWorker:
     device: str
     is_ready: bool = False
     prediction: _PendingPrediction | None = None
+    rank: int | None = None
+    last_seen: float = 0.0
 
     @property
     def is_idle(self) -> bool:
@@ -65,7 +73,8 @@ class FluxVLAInferenceServer:
                  max_pending_requests: int = 128,
                  request_timeout_s: float = 120.0,
                  startup_timeout_s: float = 900.0,
-                 deployment_id: str | None = None) -> None:
+                 deployment_id: str | None = None,
+                 continuous_sampling: Mapping[str, Any] | None = None) -> None:
         self.frontend_bind = _endpoint(frontend_bind, 'frontend_bind')
         self.backend_bind = _endpoint(backend_bind, 'backend_bind')
         self.evaluation_report_writer = evaluation_report_writer
@@ -78,6 +87,28 @@ class FluxVLAInferenceServer:
         self.startup_timeout_s = _positive_float(startup_timeout_s,
                                                  'startup_timeout_s')
         self.deployment_id = deployment_id or uuid.uuid4().hex
+        options = dict(continuous_sampling or {})
+        routing = options.pop('routing', 'single_client')
+        if routing not in {'single_client', 'fixed_worker'}:
+            raise ValueError('Unsupported continuous_sampling.routing')
+        self._fixed = (
+            continuous_sampling is not None and routing == 'fixed_worker')
+        if self._fixed and evaluation_report_writer is None:
+            raise ValueError(
+                'Fixed continuous service requires evaluation_reporting')
+        if (continuous_sampling is not None and not self._fixed
+                and self.expected_workers != 1):
+            raise ValueError('Continuous service requires one model worker')
+        if self._fixed:
+            self._continuous = FixedWorkerContinuousSession(
+                expected_workers=self.expected_workers,
+                deployment_id=self.deployment_id,
+                **options)
+        else:
+            self._continuous = (None if continuous_sampling is None else
+                                ContinuousSamplingSession(
+                                    deployment_id=self.deployment_id,
+                                    **options))
 
         self._workers: dict[bytes, _ModelWorker] = {}
         self._worker_ids: set[str] = set()
@@ -103,25 +134,25 @@ class FluxVLAInferenceServer:
     def run(self) -> None:
         import zmq
 
-        self._context = zmq.Context()
-        self._frontend = self._context.socket(zmq.ROUTER)
-        self._backend = self._context.socket(zmq.ROUTER)
-        for current in (self._frontend, self._backend):
-            current.setsockopt(zmq.LINGER, 0)
-            current.setsockopt(zmq.SNDHWM, self.max_pending_requests * 2)
-            current.setsockopt(zmq.RCVHWM, self.max_pending_requests * 2)
-        self._frontend.bind(self.frontend_bind)
-        self._backend.bind(self.backend_bind)
-        poller = zmq.Poller()
-        poller.register(self._frontend, zmq.POLLIN)
-        poller.register(self._backend, zmq.POLLIN)
-        self._install_signal_handlers()
-        startup_deadline = time.monotonic() + self.startup_timeout_s
-        print(
-            '[FluxVLA] inference server listening '
-            f'frontend={self.frontend_bind} backend={self.backend_bind}',
-            flush=True)
         try:
+            self._context = zmq.Context()
+            self._frontend = self._context.socket(zmq.ROUTER)
+            self._backend = self._context.socket(zmq.ROUTER)
+            for current in (self._frontend, self._backend):
+                current.setsockopt(zmq.LINGER, 0)
+                current.setsockopt(zmq.SNDHWM, self.max_pending_requests * 2)
+                current.setsockopt(zmq.RCVHWM, self.max_pending_requests * 2)
+            self._frontend.bind(self.frontend_bind)
+            self._backend.bind(self.backend_bind)
+            poller = zmq.Poller()
+            poller.register(self._frontend, zmq.POLLIN)
+            poller.register(self._backend, zmq.POLLIN)
+            self._install_signal_handlers()
+            startup_deadline = time.monotonic() + self.startup_timeout_s
+            print(
+                '[FluxVLA] inference server listening '
+                f'frontend={self.frontend_bind} backend={self.backend_bind}',
+                flush=True)
             while True:
                 events = dict(poller.poll(timeout=200))
                 if self._frontend in events:
@@ -129,6 +160,7 @@ class FluxVLAInferenceServer:
                 if self._backend in events:
                     self._receive_backend()
                 self._expire_predictions()
+                self._check_idle_workers(time.monotonic())
                 self._dispatch_predictions()
                 if (self.status == 'starting'
                         and time.monotonic() >= startup_deadline):
@@ -138,13 +170,28 @@ class FluxVLAInferenceServer:
                         'ready')
                 if self._shutdown_started and not self._predictions_by_id:
                     break
+        except BaseException as exc:
+            if self._continuous is not None:
+                self._continuous.fail(str(exc))
+            if self._fixed:
+                for pending in self._predictions_by_id.values():
+                    try:
+                        self._send_frontend_error(pending.route,
+                                                  pending.request_id, exc)
+                    except Exception:
+                        pass
+            raise
         finally:
-            self._begin_shutdown()
-            for current in (self._frontend, self._backend):
-                if current is not None:
-                    current.close(linger=1000)
-            if self._context is not None:
-                self._context.term()
+            try:
+                self._begin_shutdown()
+                if self._continuous is not None:
+                    self._continuous.close()
+            finally:
+                for current in (self._frontend, self._backend):
+                    if current is not None:
+                        current.close(linger=1000)
+                if self._context is not None:
+                    self._context.term()
 
     def _receive_frontend(self) -> None:
         frames = self._frontend.recv_multipart()
@@ -152,6 +199,7 @@ class FluxVLAInferenceServer:
             return
         route = tuple(frames[:-2])
         request_id = ''
+        message_type = None
         try:
             header = decode_header(frames[-2])
             if isinstance(header.get('request_id'), str):
@@ -170,6 +218,11 @@ class FluxVLAInferenceServer:
                 raise ValueError(f'Unknown endpoint: {message_type}')
         except Exception as exc:
             self._send_frontend_error(route, request_id=request_id, error=exc)
+            if (self._continuous is not None
+                    and (message_type == 'predict_action'
+                         or self._fixed and message_type != 'status')):
+                self._continuous.fail(str(exc))
+                raise
 
     def _reply_status(self, route: tuple[bytes, ...],
                       request: Mapping[str, Any]) -> None:
@@ -196,6 +249,8 @@ class FluxVLAInferenceServer:
         if request_id in self._predictions_by_id:
             raise ValueError(f'Duplicate active request_id {request_id!r}')
         if len(self._pending_predictions) >= self.max_pending_requests:
+            if self._continuous is not None:
+                raise RuntimeError('Continuous prediction queue is full')
             self._send_frontend_error(
                 route,
                 request_id,
@@ -220,8 +275,15 @@ class FluxVLAInferenceServer:
             unnorm_key=unnorm_key,
             payload=payload,
             deadline=time.monotonic() + timeout_s,
-            sampling_context=_sampling_context(header),
+            sampling_context=({} if self._continuous is not None else
+                              _sampling_context(header)),
+            request_context=(standard_request_context(header)
+                             if self._continuous is not None else {}),
         )
+        if self._continuous is not None:
+            ticket = self._continuous.accept(route, header, payload)
+            if self._fixed:
+                pending.ticket = ticket
         self._pending_predictions.append(pending)
         self._predictions_by_id[request_id] = pending
 
@@ -232,6 +294,11 @@ class FluxVLAInferenceServer:
         body = decode_frame(payload)
         if not isinstance(body, Mapping):
             raise TypeError('report_event payload must be a mapping')
+        prepared = (
+            self._continuous.prepare_report(
+                _required_string(header, 'event_type'),
+                _required_string(header, 'run_session_id'), body)
+            if self._fixed else None)
         result = self.evaluation_report_writer.process_event(
             event_type=_required_string(header, 'event_type'),
             request_id=_required_string(header, 'request_id'),
@@ -242,6 +309,11 @@ class FluxVLAInferenceServer:
         if not isinstance(result, Mapping):
             raise TypeError(
                 'evaluation report writer response must be a mapping')
+        if self._fixed:
+            if not result.get('accepted'):
+                raise RuntimeError(
+                    str(result.get('error') or 'Evaluation report rejected'))
+            self._continuous.commit_report(prepared)
         self._send_frontend(
             route,
             encode_header(
@@ -267,9 +339,16 @@ class FluxVLAInferenceServer:
             return
         worker = self._require_worker(identity, header)
         if message_type == 'ready':
-            self._mark_worker_ready(worker)
+            self._mark_worker_ready(worker, header)
         elif message_type in {'predict_result', 'predict_error'}:
             self._finish_prediction(worker, header, payload)
+        elif message_type == 'worker_heartbeat' and self._fixed:
+            if not worker.is_ready:
+                raise ValueError('Heartbeat arrived before model readiness')
+            self._continuous.check_model_identity(
+                worker.rank, worker.worker_id,
+                header.get('process_instance_id'))
+            worker.last_seen = time.monotonic()
         else:
             raise ValueError(f'Unknown model-worker message {message_type!r}')
 
@@ -286,15 +365,36 @@ class FluxVLAInferenceServer:
             node_id=_required_string(header, 'node_id'),
             device=_required_string(header, 'device'),
         )
+        if self._fixed:
+            worker.rank = _required_int(header, 'rank', minimum=0)
+            if worker.rank >= self.expected_workers or any(
+                    w.rank == worker.rank for w in self._workers.values()):
+                raise ValueError('Duplicate or out-of-range model rank')
         self._workers[identity] = worker
         self._worker_ids.add(worker_id)
 
-    def _mark_worker_ready(self, worker: _ModelWorker) -> None:
+    def _mark_worker_ready(self,
+                           worker: _ModelWorker,
+                           header: Mapping[str, Any] | None = None) -> None:
         if worker.is_ready:
             raise RuntimeError(
                 f'model worker {worker.worker_id!r} is already ready')
+        if self._fixed:
+            if _required_int(header or {}, 'process_sequence', minimum=0) != 0:
+                raise ValueError(
+                    'Continuous model must start at process sequence zero')
+            self._continuous.bind_model(worker.rank, worker.worker_id,
+                                        (header
+                                         or {}).get('process_instance_id'),
+                                        worker.device)
+        elif self._continuous is not None:
+            self._continuous.bind_model(worker.worker_id,
+                                        (header
+                                         or {}).get('process_instance_id'))
         worker.is_ready = True
-        self._idle_workers.append(worker.identity)
+        worker.last_seen = time.monotonic()
+        if not self._fixed:
+            self._idle_workers.append(worker.identity)
         print(
             f'[FluxVLA] model worker ready id={worker.worker_id} '
             f'node={worker.node_id} device={worker.device}',
@@ -312,8 +412,9 @@ class FluxVLAInferenceServer:
                 f'model worker {worker.worker_id} returned request '
                 f'{request_id!r}, expected {expected_request_id!r}')
         pending = worker.prediction
-        del self._predictions_by_id[request_id]
-        self._release_worker(worker)
+        if not self._fixed:
+            del self._predictions_by_id[request_id]
+            self._release_worker(worker)
         if header['type'] == 'predict_error':
             error = str(header.get('error') or 'model worker failed')
             self._send_frontend_error(
@@ -321,16 +422,72 @@ class FluxVLAInferenceServer:
                 request_id,
                 RuntimeError(error),
                 error_type='inference_error')
+            if self._continuous is not None:
+                self._continuous.fail(error)
+                raise RuntimeError(error)
             return
+        if self._continuous is not None:
+            try:
+                body = decode_frame(payload)
+                actions = (
+                    np.asarray(body.get('actions')) if isinstance(
+                        body, Mapping) else None)
+                elapsed = header.get('inference_time_s')
+                if (actions is None or actions.ndim != 2 or 0 in actions.shape
+                        or actions.dtype.kind not in 'fiu'
+                        or not np.isfinite(actions).all()
+                        or (np.abs(actions.astype(np.float64)) > np.finfo(
+                            np.float32).max).any()):
+                    raise ValueError(
+                        'Continuous worker returned invalid actions')
+                if (isinstance(elapsed, bool)
+                        or not isinstance(elapsed, (int, float))
+                        or not np.isfinite(elapsed) or elapsed < 0):
+                    raise ValueError(
+                        'Continuous worker returned invalid timing')
+                if self._fixed:
+                    self._continuous.complete(
+                        request_id, worker.worker_id,
+                        header.get('process_instance_id'),
+                        header.get('process_sequence'))
+                else:
+                    self._continuous.complete(request_id)
+            except Exception as exc:
+                self._send_frontend_error(pending.route, request_id, exc)
+                raise
         response_header = dict(header)
+        if self._fixed:
+            del self._predictions_by_id[request_id]
+            self._release_worker(worker)
         response_header.pop('worker_id', None)
         response_header.pop('deployment_id', None)
+        if self._fixed:
+            response_header.pop('process_instance_id', None)
+            response_header.pop('process_sequence', None)
         response_header['type'] = 'predict_response'
         response_header['ok'] = True
         self._send_frontend(pending.route, encode_frame(response_header),
                             payload)
 
     def _dispatch_predictions(self) -> None:
+        if self._fixed:
+            for _ in range(len(self._pending_predictions)):
+                pending = self._pending_predictions.popleft()
+                worker = next((w for w in self._workers.values()
+                               if w.rank == pending.ticket.rank), None)
+                if worker is None or not worker.is_idle:
+                    self._pending_predictions.append(pending)
+                    continue
+                worker.prediction = pending
+                self._send_worker(
+                    'predict',
+                    worker,
+                    request_id=pending.request_id,
+                    policy_seed=pending.policy_seed,
+                    unnorm_key=pending.unnorm_key,
+                    payload=pending.payload,
+                    **pending.request_context)
+            return
         while self._pending_predictions:
             pending = self._pending_predictions[0]
             request_id = pending.request_id
@@ -356,6 +513,7 @@ class FluxVLAInferenceServer:
                 unnorm_key=pending.unnorm_key,
                 payload=pending.payload,
                 **pending.sampling_context,
+                **pending.request_context,
             )
 
     def _next_idle_worker(self) -> _ModelWorker | None:
@@ -368,10 +526,35 @@ class FluxVLAInferenceServer:
 
     def _release_worker(self, worker: _ModelWorker) -> None:
         worker.prediction = None
-        self._idle_workers.append(worker.identity)
+        worker.last_seen = time.monotonic()
+        if not self._fixed:
+            self._idle_workers.append(worker.identity)
+
+    def _check_idle_workers(self, now: float) -> None:
+        if not self._fixed or self._shutdown_started:
+            return
+        for worker in self._workers.values():
+            if worker.is_idle and now - worker.last_seen > 30:
+                raise TimeoutError(
+                    f'Idle model heartbeat expired on {worker.worker_id}')
 
     def _expire_predictions(self) -> None:
         now = time.monotonic()
+        if self._continuous is not None:
+            expired = [
+                p for p in self._predictions_by_id.values()
+                if p.deadline <= now
+            ]
+            if expired:
+                error = TimeoutError('Continuous prediction timed out')
+                for pending in expired:
+                    self._send_frontend_error(
+                        pending.route,
+                        pending.request_id,
+                        error,
+                        error_type='timeout')
+                self._continuous.fail(str(error))
+                raise error
         if self._pending_predictions:
             retained = deque()
             while self._pending_predictions:
@@ -477,7 +660,8 @@ def run_model_worker(config_path: str,
                      node_id: str,
                      deployment_id: str,
                      device: str,
-                     cfg_options: Mapping[str, Any] | None = None) -> None:
+                     cfg_options: Mapping[str, Any] | None = None,
+                     expected_workers: int = 1) -> None:
     """Load one model replica and serve independent prediction requests."""
     import zmq
     from mmengine import Config
@@ -486,82 +670,112 @@ def run_model_worker(config_path: str,
         configure_inference_attention_defaults
     configure_inference_attention_defaults()
 
-    context = zmq.Context()
-    backend = context.socket(zmq.DEALER)
-    backend.setsockopt(zmq.IDENTITY, worker_id.encode())
-    backend.setsockopt(zmq.LINGER, 0)
-    backend.connect(_endpoint(backend_endpoint, 'backend_endpoint'))
+    with zmq.Context() as context:
+        backend = context.socket(zmq.DEALER)
+        backend.setsockopt(zmq.IDENTITY, worker_id.encode())
+        backend.setsockopt(zmq.LINGER, 0)
+        backend.connect(_endpoint(backend_endpoint, 'backend_endpoint'))
 
-    common = {
-        'deployment_id': deployment_id,
-        'worker_id': worker_id,
-    }
-    backend.send_multipart([
-        encode_header(
-            'register_worker',
-            **common,
-            node_id=node_id,
-            device=device,
-        ),
-        empty_payload(),
-    ])
-    cfg = Config.fromfile(config_path)
-    if cfg_options:
-        cfg.merge_from_dict(dict(cfg_options))
-    runner = build_serving_runner_from_config(
-        cfg, ckpt_path=ckpt_path, device=device)
-    backend.send_multipart([
-        encode_header('ready', **common),
-        empty_payload(),
-    ])
-    print(
-        f'[FluxVLA] model worker ready id={worker_id} device={device}',
-        flush=True)
-    while True:
-        frames = backend.recv_multipart()
-        header = decode_header(frames[0])
-        if header.get('deployment_id') != deployment_id:
-            raise RuntimeError('ZMQ deployment_id mismatch')
-        if header.get('worker_id') != worker_id:
-            raise RuntimeError('model worker identity mismatch')
-        if header['type'] == 'shutdown_worker':
-            break
-        if header['type'] != 'predict':
-            message_type = header['type']
-            raise RuntimeError(
-                f'Unexpected model worker command {message_type!r}')
-        request_id = _required_string(header, 'request_id')
-        payload = frames[1] if len(frames) > 1 else empty_payload()
-        try:
-            result, inference_time_s, sampling_response = _predict_request(
-                runner, header, payload)
-            backend.send_multipart([
-                encode_header(
-                    'predict_result',
-                    **common,
-                    request_id=request_id,
-                    inference_time_s=float(inference_time_s),
-                    **sampling_response,
-                ),
-                encode_frame(result),
-            ])
-        except Exception as exc:
-            print(
-                f'[FluxVLA][debug] model worker prediction failed '
-                f'worker={worker_id} request={request_id}: '
-                f'{type(exc).__name__}: {exc}',
-                flush=True,
-            )
-            traceback.print_exc()
-            backend.send_multipart([
-                encode_header(
-                    'predict_error',
-                    **common,
-                    request_id=request_id,
-                    error=f'{type(exc).__name__}: {exc}',
-                ),
-                empty_payload(),
-            ])
+        common = {
+            'deployment_id': deployment_id,
+            'worker_id': worker_id,
+        }
+        cfg = Config.fromfile(config_path)
+        if cfg_options:
+            cfg.merge_from_dict(dict(cfg_options))
+        continuous = continuous_sampling_config(
+            get_server_config(
+                require_mapping(config_get(cfg, 'themis'), 'themis')),
+            expected_workers)
+        fixed = continuous is not None and continuous.get(
+            'routing') == 'fixed_worker'
+        registration_context = ({
+            'rank': int(worker_id.rsplit('-', 1)[1])
+        } if fixed else {})
+        backend.send_multipart([
+            encode_header(
+                'register_worker',
+                **common,
+                node_id=node_id,
+                device=device,
+                **registration_context),
+            empty_payload(),
+        ])
+        runner = build_serving_runner_from_config(
+            cfg, ckpt_path=ckpt_path, device=device)
+        ready_context = ({
+            'process_instance_id': runner.process_instance_id
+        } if continuous is not None else {})
+        if fixed:
+            ready_context['process_sequence'] = runner.process_request_sequence
+        backend.send_multipart([
+            encode_header('ready', **common, **ready_context),
+            empty_payload(),
+        ])
+        print(
+            f'[FluxVLA] model worker ready id={worker_id} device={device}',
+            flush=True)
+        while True:
+            if fixed and not backend.poll(1000):
+                backend.send_multipart([
+                    encode_header(
+                        'worker_heartbeat',
+                        **common,
+                        process_instance_id=runner.process_instance_id),
+                    empty_payload(),
+                ])
+                continue
+            frames = backend.recv_multipart()
+            header = decode_header(frames[0])
+            if header.get('deployment_id') != deployment_id:
+                raise RuntimeError('ZMQ deployment_id mismatch')
+            if header.get('worker_id') != worker_id:
+                raise RuntimeError('model worker identity mismatch')
+            if header['type'] == 'shutdown_worker':
+                break
+            if header['type'] != 'predict':
+                message_type = header['type']
+                raise RuntimeError(
+                    f'Unexpected model worker command {message_type!r}')
+            request_id = _required_string(header, 'request_id')
+            payload = frames[1] if len(frames) > 1 else empty_payload()
+            try:
+                result, inference_time_s, sampling_response = _predict_request(
+                    runner,
+                    header,
+                    payload,
+                    accept_standard_process=continuous is not None)
+                if fixed:
+                    sampling_response.update(
+                        process_instance_id=runner.process_instance_id,
+                        process_sequence=runner.process_request_sequence)
+                backend.send_multipart([
+                    encode_header(
+                        'predict_result',
+                        **common,
+                        request_id=request_id,
+                        inference_time_s=float(inference_time_s),
+                        **sampling_response,
+                    ),
+                    encode_frame(result),
+                ])
+            except Exception as exc:
+                print(
+                    f'[FluxVLA][debug] model worker prediction failed '
+                    f'worker={worker_id} request={request_id}: '
+                    f'{type(exc).__name__}: {exc}',
+                    flush=True,
+                )
+                traceback.print_exc()
+                backend.send_multipart([
+                    encode_header(
+                        'predict_error',
+                        **common,
+                        request_id=request_id,
+                        error=f'{type(exc).__name__}: {exc}',
+                    ),
+                    empty_payload(),
+                ])
 
 
 def _sampling_context(header: Mapping[str, Any]) -> dict[str, Any]:
@@ -594,11 +808,24 @@ def _sampling_context(header: Mapping[str, Any]) -> dict[str, Any]:
     return context
 
 
-def _predict_request(runner, header, payload):
+def _predict_request(runner,
+                     header,
+                     payload,
+                     *,
+                     accept_standard_process=False):
     """Execute the same protocol in a worker or a CPU transport test."""
     observation = decode_frame(payload)
     if not isinstance(observation, Mapping):
         raise TypeError('prediction payload must be a mapping')
+    if accept_standard_process:
+        standard_request_context(header)
+        if runner.sampling_mode != 'process_noise_stream_v1':
+            raise ValueError(
+                'Standard continuous requests require process sampling')
+        actions, elapsed = runner.predict_action(
+            observation, str(header.get('unnorm_key', '')),
+            _required_int(header, 'policy_seed'))
+        return {'actions': np.asarray(actions, dtype=np.float32)}, elapsed, {}
     sampling = _sampling_context(header)
     mode = sampling['sampling_mode']
     if mode != runner.sampling_mode:
@@ -712,13 +939,33 @@ def launch_server_task(*,
         raise TypeError('rank must be an integer')
     if rank < 0 or rank >= world_size:
         raise ValueError('rank must be in [0, world_size)')
+    from mmengine import Config
+    cfg = Config.fromfile(config_path, import_custom_modules=False)
+    if cfg_options:
+        cfg.merge_from_dict(dict(cfg_options))
+    continuous = continuous_sampling_config(
+        get_server_config(
+            require_mapping(config_get(cfg, 'themis'), 'themis')), world_size)
+    fixed = continuous is not None and continuous.get(
+        'routing') == 'fixed_worker'
+    if fixed:
+        if int(os.environ.get('LOCAL_WORLD_SIZE', world_size)) != world_size:
+            raise ValueError(
+                'Fixed continuous service currently requires one node')
+        deployment_id = deployment_id or os.environ.get(
+            'FLUXVLA_DEPLOYMENT_ID')
+        deployment_id = _nonempty(deployment_id, 'FLUXVLA_DEPLOYMENT_ID')
+    elif continuous is not None:
+        if continuous['audit_path'].exists():
+            raise FileExistsError(continuous['audit_path'])
+        deployment_id = uuid.uuid4().hex
     if world_size > 1:
         from mmengine import Config
         cfg = Config.fromfile(config_path, import_custom_modules=False)
         if cfg_options:
             cfg.merge_from_dict(dict(cfg_options))
         mode = cfg.themis.server.get('runner', {}).get('sampling_mode')
-        if mode == 'process_noise_stream_v1':
+        if mode == 'process_noise_stream_v1' and not fixed:
             raise ValueError(
                 'Process sampling requires one model worker per endpoint')
     node_id = f'{network_socket.gethostname()}-rank-{rank}'
@@ -774,6 +1021,7 @@ def launch_server_task(*,
             deployment_id=deployment_id,
             device=device,
             cfg_options=cfg_options,
+            expected_workers=world_size,
         )
     except BaseException:
         if server_process is not None:
@@ -830,6 +1078,10 @@ def _server_process_main(*, config_path: str, ckpt_path: str,
         request_timeout_s=request_timeout_s,
         startup_timeout_s=startup_timeout_s,
         deployment_id=deployment_id,
+        continuous_sampling=continuous_sampling_config(
+            get_server_config(
+                require_mapping(config_get(cfg, 'themis'), 'themis')),
+            expected_workers),
     )
     server.run()
 

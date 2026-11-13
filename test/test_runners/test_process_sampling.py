@@ -114,10 +114,11 @@ def test_process_protocol_rejects_caller_rng_state(change):
 def test_process_recipe_preserves_the_entire_weight_and_compute_recipe():
     root = Path(__file__).resolve().parents[2] / 'configs/pi05'
     base = Config.fromfile(
-        root / 'pi05_paligemma_robolab_droid_jointpos_inference.py').to_dict()
+        root / 'pi05_paligemma_robolab_droid_jointpos_inference.py',
+        lazy_import=False).to_dict()
     process = Config.fromfile(
-        root / 'pi05_paligemma_robolab_droid_jointpos_process_inference.py'
-    ).to_dict()
+        root / 'pi05_paligemma_robolab_droid_jointpos_process_inference.py',
+        lazy_import=False).to_dict()
     runner = process['themis']['server']['runner']
     assert runner.pop('process_seed') == 0
     assert runner['sampling_mode'] == 'process_noise_stream_v1'
